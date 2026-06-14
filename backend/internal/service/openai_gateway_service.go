@@ -6091,8 +6091,7 @@ func shouldStripOpenAIHTTPPreviousResponseID(body []byte) bool {
 	}
 	validation := ValidateFunctionCallOutputContextBytes(body)
 	return !validation.HasFunctionCallOutput ||
-		validation.HasFunctionCallOutputMissingCallID ||
-		!(validation.HasToolCallContext || validation.HasItemReferenceForAllCallIDs)
+		validation.HasFunctionCallOutputMissingCallID
 }
 
 // ParseCodexRateLimitHeaders extracts Codex usage limits from response headers.

@@ -1001,6 +1001,10 @@ func (h *OpenAIGatewayHandler) validateFunctionCallOutputRequest(c *gin.Context,
 		return false
 	}
 
+	if strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) != "" {
+		return true
+	}
+
 	if validation.HasToolCallContext {
 		return true
 	}
@@ -1017,10 +1021,12 @@ func (h *OpenAIGatewayHandler) validateFunctionCallOutputRequest(c *gin.Context,
 }
 
 func openAIHTTPPreviousResponseIDAllowed(body []byte) bool {
+	if strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) == "" {
+		return false
+	}
 	validation := service.ValidateFunctionCallOutputContextBytes(body)
 	return validation.HasFunctionCallOutput &&
-		!validation.HasFunctionCallOutputMissingCallID &&
-		(validation.HasToolCallContext || validation.HasItemReferenceForAllCallIDs)
+		!validation.HasFunctionCallOutputMissingCallID
 }
 
 func (h *OpenAIGatewayHandler) acquireResponsesUserSlot(

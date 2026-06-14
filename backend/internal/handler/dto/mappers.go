@@ -261,15 +261,6 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 		if mode := a.GetUserMsgQueueMode(); mode != "" {
 			out.UserMsgQueueMode = &mode
 		}
-		// TLS指纹伪装开关
-		if a.IsTLSFingerprintEnabled() {
-			enabled := true
-			out.EnableTLSFingerprint = &enabled
-		}
-		// TLS指纹模板ID
-		if profileID := a.GetTLSFingerprintProfileID(); profileID > 0 {
-			out.TLSFingerprintProfileID = &profileID
-		}
 		// 会话ID伪装开关
 		if a.IsSessionIDMaskingEnabled() {
 			enabled := true
@@ -289,6 +280,18 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 			if customURL := a.GetCustomBaseURL(); customURL != "" {
 				out.CustomBaseURL = &customURL
 			}
+		}
+	}
+
+	// 提取 TLS 指纹伪装配置（Anthropic OAuth/SetupToken、OpenAI OAuth 账号有效）
+	if a.SupportsTLSFingerprint() {
+		if a.IsTLSFingerprintEnabled() {
+			enabled := true
+			out.EnableTLSFingerprint = &enabled
+		}
+		// 允许 -1 表示随机模板，0 表示未绑定（使用内置默认 profile）
+		if profileID := a.GetTLSFingerprintProfileID(); profileID != 0 {
+			out.TLSFingerprintProfileID = &profileID
 		}
 	}
 

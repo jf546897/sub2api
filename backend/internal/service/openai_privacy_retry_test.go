@@ -46,7 +46,7 @@ func TestAdminService_EnsureOpenAIPrivacy_RetriesNonSuccessModes(t *testing.T) {
 				},
 				Extra: map[string]any{
 					openAIExtraAutoPrivacyEnsureKey: true,
-					"privacy_mode":                 mode,
+					"privacy_mode":                  mode,
 				},
 			}
 
@@ -199,7 +199,7 @@ func TestTokenRefreshService_ensureOpenAIPrivacy_RetriesNonSuccessModes(t *testi
 				},
 				Extra: map[string]any{
 					openAIExtraAutoPrivacyEnsureKey: true,
-					"privacy_mode":                 mode,
+					"privacy_mode":                  mode,
 				},
 			}
 

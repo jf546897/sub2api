@@ -226,3 +226,38 @@ func TestValidateFunctionCallOutputContextDetectsMissingCallIDAfterContext(t *te
 	require.True(t, ValidateFunctionCallOutputContext(body).HasFunctionCallOutputMissingCallID)
 	require.True(t, ValidateFunctionCallOutputContextBytes(bodyBytes).HasFunctionCallOutputMissingCallID)
 }
+
+func TestShouldStripOpenAIHTTPPreviousResponseID(t *testing.T) {
+	cases := []struct {
+		name string
+		body []byte
+		want bool
+	}{
+		{
+			name: "plain previous_response_id",
+			body: []byte(`{"model":"gpt-5.1","previous_response_id":"resp_123","input":[{"type":"input_text","text":"hello"}]}`),
+			want: true,
+		},
+		{
+			name: "tool output with call_id",
+			body: []byte(`{"model":"gpt-5.1","previous_response_id":"resp_123","input":[{"type":"function_call_output","call_id":"call_1","output":"{}"}]}`),
+			want: false,
+		},
+		{
+			name: "tool output without call_id",
+			body: []byte(`{"model":"gpt-5.1","previous_response_id":"resp_123","input":[{"type":"function_call_output","output":"{}"}]}`),
+			want: true,
+		},
+		{
+			name: "no previous_response_id",
+			body: []byte(`{"model":"gpt-5.1","input":[{"type":"function_call_output","call_id":"call_1","output":"{}"}]}`),
+			want: false,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, shouldStripOpenAIHTTPPreviousResponseID(tt.body))
+		})
+	}
+}
