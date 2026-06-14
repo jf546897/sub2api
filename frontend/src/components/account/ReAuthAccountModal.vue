@@ -323,6 +323,14 @@ const handleClose = () => {
   emit('close')
 }
 
+const mergeReAuthExtra = (extra?: Record<string, unknown>): Record<string, unknown> => {
+  const currentExtra = (props.account?.extra as Record<string, unknown>) || {}
+  return {
+    ...currentExtra,
+    ...(extra || {})
+  }
+}
+
 const handleGenerateUrl = async () => {
   if (!props.account) return
 
@@ -368,7 +376,7 @@ const handleExchangeCode = async () => {
 
     // Build credentials and extra info
     const credentials = oauthClient.buildCredentials(tokenInfo)
-    const extra = oauthClient.buildExtraInfo(tokenInfo)
+    const extra = mergeReAuthExtra(oauthClient.buildExtraInfo(tokenInfo))
 
     try {
       // Update account with new credentials
@@ -480,7 +488,7 @@ const handleExchangeCode = async () => {
       await adminAPI.accounts.update(props.account.id, {
         type: addMethod.value, // Update type based on selected method
         credentials: tokenInfo,
-        extra
+        extra: mergeReAuthExtra(extra)
       })
 
       // Clear error status after successful re-authorization
@@ -523,7 +531,7 @@ const handleCookieAuth = async (sessionKey: string) => {
     await adminAPI.accounts.update(props.account.id, {
       type: addMethod.value, // Update type based on selected method
       credentials: tokenInfo,
-      extra
+      extra: mergeReAuthExtra(extra)
     })
 
     // Clear error status after successful re-authorization

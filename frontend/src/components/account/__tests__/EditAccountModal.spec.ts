@@ -268,6 +268,34 @@ describe('EditAccountModal', () => {
     })
   })
 
+  it('submits TLS fingerprint settings for OpenAI OAuth accounts', async () => {
+    const account = buildAccount()
+    account.name = 'OpenAI OAuth'
+    account.type = 'oauth'
+    account.credentials = {
+      refresh_token: 'rt-test',
+      base_url: 'https://api.openai.com'
+    }
+    account.extra = {
+      enable_tls_fingerprint: true,
+      tls_fingerprint_profile_id: -1
+    }
+    updateAccountMock.mockReset()
+    checkMixedChannelRiskMock.mockReset()
+    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
+    updateAccountMock.mockResolvedValue(account)
+
+    const wrapper = mountModal(account)
+
+    expect(wrapper.text()).toContain('admin.accounts.quotaControl.tlsFingerprint.label')
+
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(updateAccountMock).toHaveBeenCalledTimes(1)
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.enable_tls_fingerprint).toBe(true)
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.tls_fingerprint_profile_id).toBe(-1)
+  })
+
   it('submits OpenAI APIKey Responses support override mode', async () => {
     const account = buildAccount()
     account.extra = {

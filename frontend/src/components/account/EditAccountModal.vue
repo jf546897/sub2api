@@ -2245,6 +2245,44 @@
         </div>
       </div>
 
+      <div
+        v-if="account?.platform === 'openai' && account?.type === 'oauth'"
+        class="border-t border-gray-200 pt-4 dark:border-dark-600"
+      >
+        <div class="rounded-lg border border-gray-200 p-4 dark:border-dark-600">
+          <div class="flex items-center justify-between">
+            <div>
+              <label class="input-label mb-0">{{ t('admin.accounts.quotaControl.tlsFingerprint.label') }}</label>
+              <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                {{ t('admin.accounts.quotaControl.tlsFingerprint.hint') }}
+              </p>
+            </div>
+            <button
+              type="button"
+              @click="tlsFingerprintEnabled = !tlsFingerprintEnabled"
+              :class="[
+                'relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2',
+                tlsFingerprintEnabled ? 'bg-primary-600' : 'bg-gray-200 dark:bg-dark-600'
+              ]"
+            >
+              <span
+                :class="[
+                  'pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out',
+                  tlsFingerprintEnabled ? 'translate-x-5' : 'translate-x-0'
+                ]"
+              />
+            </button>
+          </div>
+          <div v-if="tlsFingerprintEnabled" class="mt-3">
+            <select v-model="tlsFingerprintProfileId" class="input">
+              <option :value="null">{{ t('admin.accounts.quotaControl.tlsFingerprint.defaultProfile') }}</option>
+              <option v-if="tlsFingerprintProfiles.length > 0" :value="-1">{{ t('admin.accounts.quotaControl.tlsFingerprint.randomProfile') }}</option>
+              <option v-for="p in tlsFingerprintProfiles" :key="p.id" :value="p.id">{{ p.name }}</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
       <div class="border-t border-gray-200 pt-4 dark:border-dark-600">
         <div>
           <label class="input-label">{{ t('common.status') }}</label>
@@ -2575,6 +2613,29 @@ const cacheTTLOverrideEnabled = ref(false)
 const cacheTTLOverrideTarget = ref<string>('5m')
 const customBaseUrlEnabled = ref(false)
 const customBaseUrl = ref('')
+
+type TLSFingerprintAccountLike = Pick<Account, 'platform' | 'type'>
+
+function supportsTLSFingerprintAccount(account: TLSFingerprintAccountLike | null | undefined) {
+  return !!account && (
+    (account.platform === 'anthropic' && (account.type === 'oauth' || account.type === 'setup-token')) ||
+    (account.platform === 'openai' && account.type === 'oauth')
+  )
+}
+
+function writeTLSFingerprintExtra(extra: Record<string, unknown>) {
+  if (tlsFingerprintEnabled.value) {
+    extra.enable_tls_fingerprint = true
+    if (tlsFingerprintProfileId.value != null) {
+      extra.tls_fingerprint_profile_id = tlsFingerprintProfileId.value
+    } else {
+      delete extra.tls_fingerprint_profile_id
+    }
+  } else {
+    delete extra.enable_tls_fingerprint
+    delete extra.tls_fingerprint_profile_id
+  }
+}
 
 // OpenAI 自动透传开关（OAuth/API Key）
 const openaiPassthroughEnabled = ref(false)
@@ -3456,6 +3517,13 @@ function loadQuotaControlSettings(account: Account) {
   customBaseUrlEnabled.value = false
   customBaseUrl.value = ''
 
+  if (supportsTLSFingerprintAccount(account)) {
+    const extra = (account.extra as Record<string, unknown>) || {}
+    tlsFingerprintEnabled.value = account.enable_tls_fingerprint === true || extra.enable_tls_fingerprint === true
+    const profileID = account.tls_fingerprint_profile_id ?? extra.tls_fingerprint_profile_id
+    tlsFingerprintProfileId.value = typeof profileID === 'number' ? profileID : null
+  }
+
   // Remaining quota control settings only apply to Anthropic accounts
   if (account.platform !== 'anthropic') {
     return
@@ -3489,12 +3557,6 @@ function loadQuotaControlSettings(account: Account) {
 
   // UMQ mode（独立于 RPM 加载，防止编辑无 RPM 账号时丢失已有配置）
   userMsgQueueMode.value = account.user_msg_queue_mode ?? ''
-
-  // Load TLS fingerprint setting
-  if (account.enable_tls_fingerprint === true) {
-    tlsFingerprintEnabled.value = true
-  }
-  tlsFingerprintProfileId.value = account.tls_fingerprint_profile_id ?? null
 
   // Load session ID masking setting
   if (account.session_id_masking_enabled === true) {
@@ -4014,18 +4076,7 @@ const handleSubmit = async () => {
       }
       delete newExtra.user_msg_queue_enabled  // 清理旧字段
 
-      // TLS fingerprint setting
-      if (tlsFingerprintEnabled.value) {
-        newExtra.enable_tls_fingerprint = true
-        if (tlsFingerprintProfileId.value) {
-          newExtra.tls_fingerprint_profile_id = tlsFingerprintProfileId.value
-        } else {
-          delete newExtra.tls_fingerprint_profile_id
-        }
-      } else {
-        delete newExtra.enable_tls_fingerprint
-        delete newExtra.tls_fingerprint_profile_id
-      }
+      writeTLSFingerprintExtra(newExtra)
 
       // Session ID masking setting
       if (sessionIdMaskingEnabled.value) {
@@ -4080,6 +4131,7 @@ const handleSubmit = async () => {
       if (props.account.type === 'oauth') {
         newExtra.openai_oauth_responses_websockets_v2_mode = openaiOAuthResponsesWebSocketV2Mode.value
         newExtra.openai_oauth_responses_websockets_v2_enabled = isOpenAIWSModeEnabled(openaiOAuthResponsesWebSocketV2Mode.value)
+        writeTLSFingerprintExtra(newExtra)
       } else if (props.account.type === 'apikey') {
         newExtra.openai_apikey_responses_websockets_v2_mode = openaiAPIKeyResponsesWebSocketV2Mode.value
         newExtra.openai_apikey_responses_websockets_v2_enabled = isOpenAIWSModeEnabled(openaiAPIKeyResponsesWebSocketV2Mode.value)
