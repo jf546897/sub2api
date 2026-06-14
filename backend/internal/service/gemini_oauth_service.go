@@ -80,6 +80,23 @@ func NewGeminiOAuthService(
 	}
 }
 
+func resolveGeminiProxyURL(ctx context.Context, proxyRepo ProxyRepository, proxyID *int64) (string, error) {
+	if proxyID == nil {
+		return "", nil
+	}
+	if proxyRepo == nil {
+		return "", fmt.Errorf("gemini proxy %d is configured but proxy repository is unavailable", *proxyID)
+	}
+	proxy, err := proxyRepo.GetByID(ctx, *proxyID)
+	if err != nil {
+		return "", fmt.Errorf("gemini proxy %d lookup failed: %w", *proxyID, err)
+	}
+	if proxy == nil {
+		return "", fmt.Errorf("gemini proxy %d not found", *proxyID)
+	}
+	return proxy.URL(), nil
+}
+
 func (s *GeminiOAuthService) GetOAuthConfig() *GeminiOAuthCapabilities {
 	// AI Studio OAuth is only enabled when the operator configures a custom OAuth client.
 	clientID := strings.TrimSpace(s.cfg.Gemini.OAuth.ClientID)
@@ -113,12 +130,9 @@ func (s *GeminiOAuthService) GenerateAuthURL(ctx context.Context, proxyID *int64
 		return nil, fmt.Errorf("failed to generate session ID: %w", err)
 	}
 
-	var proxyURL string
-	if proxyID != nil {
-		proxy, err := s.proxyRepo.GetByID(ctx, *proxyID)
-		if err == nil && proxy != nil {
-			proxyURL = proxy.URL()
-		}
+	proxyURL, err := resolveGeminiProxyURL(ctx, s.proxyRepo, proxyID)
+	if err != nil {
+		return nil, err
 	}
 
 	// OAuth client selection:
@@ -411,8 +425,15 @@ func (s *GeminiOAuthService) RefreshAccountGoogleOneTier(
 
 	// 获取 proxy URL
 	var proxyURL string
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
+	if account.ProxyID != nil {
+		if account.Proxy != nil {
+			proxyURL = account.Proxy.URL()
+		} else {
+			proxyURL, err = resolveGeminiProxyURL(ctx, s.proxyRepo, account.ProxyID)
+			if err != nil {
+				return "", nil, nil, err
+			}
+		}
 	}
 
 	// 调用 Drive API
@@ -458,10 +479,11 @@ func (s *GeminiOAuthService) ExchangeCode(ctx context.Context, input *GeminiExch
 
 	proxyURL := session.ProxyURL
 	if input.ProxyID != nil {
-		proxy, err := s.proxyRepo.GetByID(ctx, *input.ProxyID)
-		if err == nil && proxy != nil {
-			proxyURL = proxy.URL()
+		resolvedProxyURL, err := resolveGeminiProxyURL(ctx, s.proxyRepo, input.ProxyID)
+		if err != nil {
+			return nil, err
 		}
+		proxyURL = resolvedProxyURL
 	}
 	logger.LegacyPrintf("service.gemini_oauth", "[GeminiOAuth] ProxyURL: %s", proxyURL)
 
@@ -746,12 +768,9 @@ func (s *GeminiOAuthService) RefreshAccountToken(ctx context.Context, account *A
 		oauthType = "code_assist"
 	}
 
-	var proxyURL string
-	if account.ProxyID != nil {
-		proxy, err := s.proxyRepo.GetByID(ctx, *account.ProxyID)
-		if err == nil && proxy != nil {
-			proxyURL = proxy.URL()
-		}
+	proxyURL, err := resolveGeminiProxyURL(ctx, s.proxyRepo, account.ProxyID)
+	if err != nil {
+		return nil, err
 	}
 
 	tokenInfo, err := s.RefreshToken(ctx, oauthType, refreshToken, proxyURL)

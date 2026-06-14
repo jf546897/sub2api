@@ -2665,7 +2665,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			}
 		}
 	}
-	if wsDecision.Transport != OpenAIUpstreamTransportResponsesWebsocketV2 && gjson.GetBytes(body, "previous_response_id").Exists() {
+	if wsDecision.Transport != OpenAIUpstreamTransportResponsesWebsocketV2 && shouldStripOpenAIHTTPPreviousResponseID(body) {
 		markPatchDelete("previous_response_id")
 	}
 	if openAIRequestBodyMayContainEmptyBase64InputImage(body) {
@@ -6083,6 +6083,16 @@ func (s *OpenAIGatewayService) resolveOpenAIChannelPricing(ctx context.Context, 
 		return resolved
 	}
 	return nil
+}
+
+func shouldStripOpenAIHTTPPreviousResponseID(body []byte) bool {
+	if !gjson.GetBytes(body, "previous_response_id").Exists() {
+		return false
+	}
+	validation := ValidateFunctionCallOutputContextBytes(body)
+	return !validation.HasFunctionCallOutput ||
+		validation.HasFunctionCallOutputMissingCallID ||
+		!(validation.HasToolCallContext || validation.HasItemReferenceForAllCallIDs)
 }
 
 // ParseCodexRateLimitHeaders extracts Codex usage limits from response headers.

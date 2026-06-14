@@ -1,16 +1,15 @@
--- Remove unused Ops retry/replay storage.
--- The retry endpoints are no longer exposed, so keeping request bodies and
--- retry audit rows only increases write width, memory retention, and DB size.
+-- Mark unused Ops retry/replay storage as retired without destroying data.
+-- The retry endpoints are no longer exposed, but already-captured request
+-- context and retry audit rows may be needed for incident review. Keep this
+-- migration intentionally non-destructive.
 
-DROP TABLE IF EXISTS ops_retry_attempts CASCADE;
+DO $$
+BEGIN
+  IF to_regclass('public.ops_error_logs') IS NOT NULL THEN
+    COMMENT ON TABLE ops_error_logs IS 'Ops error logs (vNext). Stores sanitized error details; request replay fields are retained only for historical compatibility.';
+  END IF;
 
-ALTER TABLE ops_error_logs
-  DROP COLUMN IF EXISTS request_body,
-  DROP COLUMN IF EXISTS request_headers,
-  DROP COLUMN IF EXISTS request_body_truncated,
-  DROP COLUMN IF EXISTS request_body_bytes,
-  DROP COLUMN IF EXISTS is_retryable,
-  DROP COLUMN IF EXISTS retry_count,
-  DROP COLUMN IF EXISTS resolved_retry_id;
-
-COMMENT ON TABLE ops_error_logs IS 'Ops error logs (vNext). Stores sanitized error details; request replay storage removed.';
+  IF to_regclass('public.ops_retry_attempts') IS NOT NULL THEN
+    COMMENT ON TABLE ops_retry_attempts IS 'Historical audit table for retired ops retry/replay flows; retained for compatibility and incident review.';
+  END IF;
+END $$;

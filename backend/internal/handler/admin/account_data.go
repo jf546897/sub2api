@@ -666,6 +666,9 @@ func validateDataAccount(item DataAccount) error {
 	default:
 		return fmt.Errorf("account type is invalid: %s", item.Type)
 	}
+	if isOpenAIOAuthDataAccount(item) && !hasNonEmptyCredential(item.Credentials, "refresh_token") {
+		return errors.New("openai oauth import requires refresh_token")
+	}
 	if item.RateMultiplier != nil && *item.RateMultiplier < 0 {
 		return errors.New("rate_multiplier must be >= 0")
 	}
@@ -676,6 +679,16 @@ func validateDataAccount(item DataAccount) error {
 		return errors.New("priority must be >= 0")
 	}
 	return nil
+}
+
+func isOpenAIOAuthDataAccount(item DataAccount) bool {
+	return strings.ToLower(strings.TrimSpace(item.Platform)) == service.PlatformOpenAI &&
+		strings.ToLower(strings.TrimSpace(item.Type)) == service.AccountTypeOAuth
+}
+
+func hasNonEmptyCredential(credentials map[string]any, key string) bool {
+	value, _ := credentials[key].(string)
+	return strings.TrimSpace(value) != ""
 }
 
 func defaultProxyName(name string) string {

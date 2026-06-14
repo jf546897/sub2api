@@ -1668,9 +1668,6 @@ func shouldKeepIngressPreviousResponseID(
 	lastTurnResponseID string,
 	hasFunctionCallOutput bool,
 ) (bool, string, error) {
-	if hasFunctionCallOutput {
-		return true, "has_function_call_output", nil
-	}
 	currentPreviousResponseID := strings.TrimSpace(openAIWSPayloadStringFromRaw(currentPayload, "previous_response_id"))
 	if currentPreviousResponseID == "" {
 		return false, "missing_previous_response_id", nil
@@ -1681,6 +1678,9 @@ func shouldKeepIngressPreviousResponseID(
 	}
 	if currentPreviousResponseID != expectedPreviousResponseID {
 		return false, "previous_response_id_mismatch", nil
+	}
+	if hasFunctionCallOutput {
+		return true, "has_function_call_output_chained", nil
 	}
 	if len(previousPayload) == 0 {
 		return false, "missing_previous_turn_payload", nil
@@ -1723,9 +1723,6 @@ func shouldKeepIngressPreviousResponseIDWithStrictState(
 	lastTurnResponseID string,
 	hasFunctionCallOutput bool,
 ) (bool, string, error) {
-	if hasFunctionCallOutput {
-		return true, "has_function_call_output", nil
-	}
 	currentPreviousResponseID := strings.TrimSpace(openAIWSPayloadStringFromRaw(currentPayload, "previous_response_id"))
 	if currentPreviousResponseID == "" {
 		return false, "missing_previous_response_id", nil
@@ -1736,6 +1733,9 @@ func shouldKeepIngressPreviousResponseIDWithStrictState(
 	}
 	if currentPreviousResponseID != expectedPreviousResponseID {
 		return false, "previous_response_id_mismatch", nil
+	}
+	if hasFunctionCallOutput {
+		return true, "has_function_call_output_chained", nil
 	}
 	if previousState == nil {
 		return false, "missing_previous_turn_payload", nil

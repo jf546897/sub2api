@@ -12,9 +12,12 @@ package tlsfingerprint
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"strings"
@@ -264,6 +267,114 @@ func TestBuildClientHelloSpec(t *testing.T) {
 	}
 }
 
+func TestProfileCacheKeyUsesEffectiveFingerprint(t *testing.T) {
+	defaultKey := ProfileCacheKey(nil)
+	renamedDefaultKey := ProfileCacheKey(&Profile{Name: "renamed default"})
+	if defaultKey != renamedDefaultKey {
+		t.Fatal("expected profile name to be excluded from cache key")
+	}
+
+	customKey := ProfileCacheKey(&Profile{
+		Name:          "renamed default",
+		ALPNProtocols: []string{"h2"},
+	})
+	if customKey == defaultKey {
+		t.Fatal("expected TLS fingerprint fields to change cache key")
+	}
+}
+
+func TestProxyDialContextAddsDefaultDeadline(t *testing.T) {
+	ctx, cancel := proxyDialContext(context.Background())
+	defer cancel()
+
+	if _, ok := ctx.Deadline(); !ok {
+		t.Fatal("expected default proxy dial context to have a deadline")
+	}
+}
+
+func TestHTTPProxyDialerConnectHonorsContext(t *testing.T) {
+	proxyURL := newSilentProxyURL(t, "http")
+	dialer := NewHTTPProxyDialer(&Profile{Name: "test"}, proxyURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	conn, err := dialer.DialTLSContext(ctx, "tcp", "example.com:443")
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if err == nil {
+		t.Fatal("expected HTTP CONNECT to fail when proxy never responds")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("expected HTTP CONNECT to respect context quickly, elapsed=%s", elapsed)
+	}
+}
+
+func TestHTTPProxyDialerHTTPSProxyUsesTLSBeforeConnect(t *testing.T) {
+	oldFactory := newHTTPSProxyTLSConfig
+	newHTTPSProxyTLSConfig = func(serverName string) *tls.Config {
+		return &tls.Config{
+			InsecureSkipVerify: true, // test-only self-signed proxy certificate
+			MinVersion:         tls.VersionTLS12,
+		}
+	}
+	defer func() {
+		newHTTPSProxyTLSConfig = oldFactory
+	}()
+
+	seenConnect := make(chan struct{}, 1)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect && r.Host == "example.com:443" {
+			select {
+			case seenConnect <- struct{}{}:
+			default:
+			}
+		}
+		http.Error(w, "stop before target TLS handshake", http.StatusBadGateway)
+	}))
+	defer server.Close()
+
+	dialer := NewHTTPProxyDialer(&Profile{Name: "test"}, mustParseURL(server.URL))
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	conn, err := dialer.DialTLSContext(ctx, "tcp", "example.com:443")
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if err == nil {
+		t.Fatal("expected CONNECT to fail after HTTPS proxy receives request")
+	}
+	if !strings.Contains(err.Error(), "proxy CONNECT failed") {
+		t.Fatalf("expected proxy CONNECT failure, got %v", err)
+	}
+	select {
+	case <-seenConnect:
+	default:
+		t.Fatal("expected HTTPS proxy to receive CONNECT inside TLS")
+	}
+}
+
+func TestSOCKS5ProxyDialerConnectHonorsContext(t *testing.T) {
+	proxyURL := newSilentProxyURL(t, "socks5")
+	dialer := NewSOCKS5ProxyDialer(&Profile{Name: "test"}, proxyURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	conn, err := dialer.DialTLSContext(ctx, "tcp", "example.com:443")
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if err == nil {
+		t.Fatal("expected SOCKS5 connect to fail when proxy never responds")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("expected SOCKS5 connect to respect context quickly, elapsed=%s", elapsed)
+	}
+}
+
 // TestToUTLSCurves tests curve ID conversion.
 func TestToUTLSCurves(t *testing.T) {
 	input := []uint16{0x001d, 0x0017, 0x0018}
@@ -287,6 +398,32 @@ func mustParseURL(rawURL string) *url.URL {
 		panic(err)
 	}
 	return u
+}
+
+func newSilentProxyURL(t *testing.T, scheme string) *url.URL {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen silent proxy: %v", err)
+	}
+	done := make(chan struct{})
+
+	t.Cleanup(func() {
+		close(done)
+		_ = ln.Close()
+	})
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		<-done
+	}()
+
+	return mustParseURL(scheme + "://" + ln.Addr().String())
 }
 
 // TestAllProfiles tests multiple TLS fingerprint profiles against tls.peet.ws.

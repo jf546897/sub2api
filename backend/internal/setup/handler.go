@@ -107,8 +107,10 @@ func validatePort(port int) bool {
 
 // validateSSLMode checks if SSL mode is valid
 func validateSSLMode(mode string) bool {
+	mode = strings.ToLower(strings.TrimSpace(mode))
 	validModes := map[string]bool{
-		"disable": true, "require": true, "verify-ca": true, "verify-full": true,
+		"disable": true, "allow": true, "prefer": true,
+		"require": true, "verify-ca": true, "verify-full": true,
 	}
 	return validModes[mode]
 }
@@ -154,6 +156,10 @@ func testDatabase(c *gin.Context) {
 	}
 	if !validateSSLMode(req.SSLMode) {
 		response.Error(c, http.StatusBadRequest, "Invalid SSL mode")
+		return
+	}
+	if err := ensureDataDir(); err != nil {
+		response.Error(c, http.StatusInternalServerError, "Data directory unavailable: "+err.Error())
 		return
 	}
 

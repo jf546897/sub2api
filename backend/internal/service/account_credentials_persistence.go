@@ -11,7 +11,7 @@ func persistAccountCredentials(ctx context.Context, repo AccountRepository, acco
 		return nil
 	}
 
-	account.Credentials = cloneCredentials(credentials)
+	account.Credentials = MergeCredentials(account.Credentials, cloneCredentials(credentials))
 	if updater, ok := any(repo).(accountCredentialsUpdater); ok {
 		return updater.UpdateCredentials(ctx, account.ID, account.Credentials)
 	}

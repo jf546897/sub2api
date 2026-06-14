@@ -344,6 +344,40 @@ func TestMergeCredentials_NewOverridesOld(t *testing.T) {
 	require.Equal(t, "old-refresh", result["refresh_token"]) // preserved
 }
 
+func TestMergeCredentials_PreservesOldRefreshTokenWhenNewRefreshTokenEmpty(t *testing.T) {
+	old := map[string]any{"access_token": "old-token", "refresh_token": "old-refresh"}
+	new := map[string]any{"access_token": "new-token", "refresh_token": "  "}
+
+	result := MergeCredentials(old, new)
+
+	require.Equal(t, "new-token", result["access_token"])
+	require.Equal(t, "old-refresh", result["refresh_token"])
+}
+
+func TestPersistAccountCredentials_MergesWithExistingCredentials(t *testing.T) {
+	account := &Account{
+		ID: 42,
+		Credentials: map[string]any{
+			"access_token":  "old-access",
+			"refresh_token": "old-refresh",
+			"client_id":     "client-id",
+		},
+	}
+	repo := &refreshAPIAccountRepo{account: account}
+
+	err := persistAccountCredentials(context.Background(), repo, account, map[string]any{
+		"access_token": "new-access",
+		"expires_at":   "1893456000",
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, 1, repo.updateCredentialsCalls)
+	require.Equal(t, "new-access", repo.account.Credentials["access_token"])
+	require.Equal(t, "old-refresh", repo.account.Credentials["refresh_token"])
+	require.Equal(t, "client-id", repo.account.Credentials["client_id"])
+	require.Equal(t, "1893456000", repo.account.Credentials["expires_at"])
+}
+
 // ========== BuildClaudeAccountCredentials tests ==========
 
 func TestBuildClaudeAccountCredentials_Full(t *testing.T) {
@@ -634,9 +668,9 @@ func TestClaudeProviderRefreshPolicy(t *testing.T) {
 
 func TestOpenAIProviderRefreshPolicy(t *testing.T) {
 	p := OpenAIProviderRefreshPolicy()
-	require.Equal(t, ProviderRefreshErrorUseExistingToken, p.OnRefreshError)
+	require.Equal(t, ProviderRefreshErrorReturn, p.OnRefreshError)
 	require.Equal(t, ProviderLockHeldWaitForCache, p.OnLockHeld)
-	require.Equal(t, time.Minute, p.FailureTTL)
+	require.Equal(t, time.Duration(0), p.FailureTTL)
 }
 
 func TestGeminiProviderRefreshPolicy(t *testing.T) {

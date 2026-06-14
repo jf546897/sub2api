@@ -18,10 +18,12 @@ func TestNeedsToolContinuationSignals(t *testing.T) {
 		{name: "previous_response_id", body: map[string]any{"previous_response_id": "resp_1"}, want: true},
 		{name: "previous_response_id_blank", body: map[string]any{"previous_response_id": "  "}, want: false},
 		{name: "function_call_output", body: map[string]any{"input": []any{map[string]any{"type": "function_call_output"}}}, want: true},
+		{name: "function_call_output_object", body: map[string]any{"input": map[string]any{"type": "function_call_output"}}, want: true},
 		{name: "tool_search_output", body: map[string]any{"input": []any{map[string]any{"type": "tool_search_output"}}}, want: true},
 		{name: "custom_tool_call_output", body: map[string]any{"input": []any{map[string]any{"type": "custom_tool_call_output"}}}, want: true},
 		{name: "mcp_tool_call_output", body: map[string]any{"input": []any{map[string]any{"type": "mcp_tool_call_output"}}}, want: true},
 		{name: "item_reference", body: map[string]any{"input": []any{map[string]any{"type": "item_reference"}}}, want: true},
+		{name: "item_reference_object", body: map[string]any{"input": map[string]any{"type": "item_reference"}}, want: true},
 		{name: "tools", body: map[string]any{"tools": []any{map[string]any{"type": "function"}}}, want: true},
 		{name: "tools_empty", body: map[string]any{"tools": []any{}}, want: false},
 		{name: "tools_invalid", body: map[string]any{"tools": "bad"}, want: false},
@@ -50,6 +52,9 @@ func TestHasFunctionCallOutput(t *testing.T) {
 		require.True(t, HasFunctionCallOutput(map[string]any{
 			"input": []any{map[string]any{"type": typ}},
 		}), typ)
+		require.True(t, HasFunctionCallOutput(map[string]any{
+			"input": map[string]any{"type": typ},
+		}), typ+"_object")
 	}
 	require.False(t, HasFunctionCallOutput(map[string]any{
 		"input": "text",
@@ -70,6 +75,9 @@ func TestHasToolCallContext(t *testing.T) {
 		require.True(t, HasToolCallContext(map[string]any{
 			"input": []any{map[string]any{"type": typ, "call_id": "call_1"}},
 		}), typ)
+		require.True(t, HasToolCallContext(map[string]any{
+			"input": map[string]any{"type": typ, "call_id": "call_1"},
+		}), typ+"_object")
 	}
 	require.False(t, HasToolCallContext(map[string]any{
 		"input": []any{map[string]any{"type": "tool_call"}},
@@ -118,6 +126,9 @@ func TestHasItemReferenceForCallIDs(t *testing.T) {
 	require.True(t, HasItemReferenceForCallIDs(req, []string{"call_1"}))
 	require.True(t, HasItemReferenceForCallIDs(req, []string{"call_1", "call_2"}))
 	require.False(t, HasItemReferenceForCallIDs(req, []string{"call_1", "call_3"}))
+	require.True(t, HasItemReferenceForCallIDs(map[string]any{
+		"input": map[string]any{"type": "item_reference", "id": "call_1"},
+	}, []string{"call_1"}))
 }
 
 func TestValidateFunctionCallOutputContextBytesMatchesMapValidation(t *testing.T) {
@@ -135,8 +146,16 @@ func TestValidateFunctionCallOutputContextBytesMatchesMapValidation(t *testing.T
 			body: map[string]any{"input": []any{map[string]any{"type": "function_call_output"}}},
 		},
 		{
+			name: "single_object_missing_call_id",
+			body: map[string]any{"input": map[string]any{"type": "function_call_output"}},
+		},
+		{
 			name: "call_id_without_reference",
 			body: map[string]any{"input": []any{map[string]any{"type": "function_call_output", "call_id": "call_1"}}},
+		},
+		{
+			name: "single_object_call_id_without_reference",
+			body: map[string]any{"input": map[string]any{"type": "function_call_output", "call_id": "call_1"}},
 		},
 		{
 			name: "matching_reference",
@@ -158,6 +177,14 @@ func TestValidateFunctionCallOutputContextBytesMatchesMapValidation(t *testing.T
 			body: map[string]any{"input": []any{
 				map[string]any{"type": "function_call_output", "call_id": "call_1"},
 				map[string]any{"type": "function_call", "call_id": "call_1"},
+			}},
+		},
+		{
+			name: "tool_context_does_not_hide_later_missing_call_id",
+			body: map[string]any{"input": []any{
+				map[string]any{"type": "function_call_output", "call_id": "call_1"},
+				map[string]any{"type": "function_call", "call_id": "call_1"},
+				map[string]any{"type": "tool_search_output", "output": "{}"},
 			}},
 		},
 		{
@@ -183,4 +210,19 @@ func TestValidateFunctionCallOutputContextBytesMatchesMapValidation(t *testing.T
 			require.Equal(t, ValidateFunctionCallOutputContext(tt.body), ValidateFunctionCallOutputContextBytes(bodyBytes))
 		})
 	}
+}
+
+func TestValidateFunctionCallOutputContextDetectsMissingCallIDAfterContext(t *testing.T) {
+	body := map[string]any{
+		"input": []any{
+			map[string]any{"type": "function_call_output", "call_id": "call_1"},
+			map[string]any{"type": "function_call", "call_id": "call_1"},
+			map[string]any{"type": "tool_search_output", "output": "{}"},
+		},
+	}
+	bodyBytes, err := json.Marshal(body)
+	require.NoError(t, err)
+
+	require.True(t, ValidateFunctionCallOutputContext(body).HasFunctionCallOutputMissingCallID)
+	require.True(t, ValidateFunctionCallOutputContextBytes(bodyBytes).HasFunctionCallOutputMissingCallID)
 }

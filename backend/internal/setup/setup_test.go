@@ -2,6 +2,7 @@ package setup
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -88,6 +89,24 @@ func TestWriteConfigFileKeepsDefaultUserConcurrency(t *testing.T) {
 	}
 }
 
+func TestEnsureDataDirCreatesMissingDirectory(t *testing.T) {
+	base := t.TempDir()
+	target := filepath.Join(base, "nested", "data")
+	t.Setenv("DATA_DIR", target)
+
+	if err := ensureDataDir(); err != nil {
+		t.Fatalf("ensureDataDir() error = %v", err)
+	}
+
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("ensureDataDir() did not create directory %q", target)
+	}
+}
+
 func TestBuildDatabaseConnectionDSNsUsesPostgresForBootstrap(t *testing.T) {
 	cfg := &DatabaseConfig{
 		Host:     "db",
@@ -108,5 +127,99 @@ func TestBuildDatabaseConnectionDSNsUsesPostgresForBootstrap(t *testing.T) {
 	}
 	if !strings.Contains(targetDSN, "dbname=sub2api") {
 		t.Fatalf("target DSN = %q, want configured database", targetDSN)
+	}
+}
+
+func TestBuildPostgresDSNEscapesSpecialCharacters(t *testing.T) {
+	cfg := &DatabaseConfig{
+		Host:     "db.internal",
+		Port:     5432,
+		User:     "sub2 api",
+		Password: `pa ss'\word`,
+		DBName:   "sub2 api",
+		SSLMode:  "prefer",
+	}
+
+	_, targetDSN := buildDatabaseConnectionDSNs(cfg)
+
+	for _, want := range []string{
+		`user='sub2 api'`,
+		`password='pa ss\'\\word'`,
+		`dbname='sub2 api'`,
+		"sslmode=prefer",
+	} {
+		if !strings.Contains(targetDSN, want) {
+			t.Fatalf("target DSN = %q, want %q", targetDSN, want)
+		}
+	}
+}
+
+func TestValidateDatabaseConfigForConnection(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     *DatabaseConfig
+		wantErr bool
+	}{
+		{
+			name: "allows quoted identifier names and prefer sslmode",
+			cfg: &DatabaseConfig{
+				Host:    "db.internal",
+				Port:    5432,
+				User:    "sub2 api",
+				DBName:  "sub2 api",
+				SSLMode: "prefer",
+			},
+		},
+		{
+			name:    "rejects nil config",
+			cfg:     nil,
+			wantErr: true,
+		},
+		{
+			name: "rejects invalid port",
+			cfg: &DatabaseConfig{
+				Host:    "db.internal",
+				Port:    0,
+				User:    "sub2api",
+				DBName:  "sub2api",
+				SSLMode: "disable",
+			},
+			wantErr: true,
+		},
+		{
+			name: "rejects empty database name",
+			cfg: &DatabaseConfig{
+				Host:    "db.internal",
+				Port:    5432,
+				User:    "sub2api",
+				DBName:  " ",
+				SSLMode: "disable",
+			},
+			wantErr: true,
+		},
+		{
+			name: "rejects invalid sslmode",
+			cfg: &DatabaseConfig{
+				Host:    "db.internal",
+				Port:    5432,
+				User:    "sub2api",
+				DBName:  "sub2api",
+				SSLMode: "unsafe",
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateDatabaseConfigForConnection(tc.cfg)
+			if tc.wantErr && err == nil {
+				t.Fatalf("validateDatabaseConfigForConnection() error = nil, want error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("validateDatabaseConfigForConnection() error = %v", err)
+			}
+		})
 	}
 }

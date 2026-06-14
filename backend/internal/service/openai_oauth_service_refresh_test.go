@@ -30,7 +30,7 @@ func (s *openaiOAuthClientRefreshStub) RefreshTokenWithClientID(ctx context.Cont
 	return nil, errors.New("not implemented")
 }
 
-func TestOpenAIOAuthService_RefreshAccountToken_NoRefreshTokenUsesExistingAccessToken(t *testing.T) {
+func TestOpenAIOAuthService_RefreshAccountToken_NoRefreshTokenReturnsError(t *testing.T) {
 	client := &openaiOAuthClientRefreshStub{}
 	svc := NewOpenAIOAuthService(nil, client)
 	var privacyClientCalls int32
@@ -52,12 +52,38 @@ func TestOpenAIOAuthService_RefreshAccountToken_NoRefreshTokenUsesExistingAccess
 	}
 
 	info, err := svc.RefreshAccountToken(context.Background(), account)
-	require.NoError(t, err)
-	require.NotNil(t, info)
-	require.Equal(t, "existing-access-token", info.AccessToken)
-	require.Equal(t, "client-id-1", info.ClientID)
-	require.Zero(t, atomic.LoadInt32(&client.refreshCalls), "existing access token should be reused without calling refresh")
-	require.Positive(t, atomic.LoadInt32(&privacyClientCalls), "existing access token should still run enrichment")
+	require.Error(t, err)
+	require.Nil(t, info)
+	require.Contains(t, err.Error(), "no refresh token")
+	require.Zero(t, atomic.LoadInt32(&client.refreshCalls), "missing refresh_token must stop before refresh")
+	require.Zero(t, atomic.LoadInt32(&privacyClientCalls), "missing refresh_token must not call ChatGPT enrichment or privacy")
+}
+
+func TestOpenAIOAuthService_RefreshAccountToken_ProxyLookupErrorStopsRefresh(t *testing.T) {
+	client := &openaiOAuthClientRefreshStub{}
+	proxyRepo := &mockProxyRepoForOAuth{
+		getByIDFunc: func(ctx context.Context, id int64) (*Proxy, error) {
+			return nil, errors.New("proxy lookup failed")
+		},
+	}
+	svc := NewOpenAIOAuthService(proxyRepo, client)
+	proxyID := int64(42)
+	account := &Account{
+		ID:       88,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		ProxyID:  &proxyID,
+		Credentials: map[string]any{
+			"refresh_token": "refresh-token",
+		},
+	}
+
+	info, err := svc.RefreshAccountToken(context.Background(), account)
+
+	require.Error(t, err)
+	require.Nil(t, info)
+	require.Contains(t, err.Error(), "proxy lookup failed")
+	require.Zero(t, atomic.LoadInt32(&client.refreshCalls), "proxy lookup failure must stop before refresh")
 }
 
 func TestOpenAITokenRefresher_NeedsRefresh_SkipsAccountWithoutRefreshToken(t *testing.T) {
@@ -84,6 +110,25 @@ func TestOpenAITokenRefresher_NeedsRefresh_SkipsAccountWithoutRefreshToken(t *te
 		},
 	}
 	require.True(t, refresher.NeedsRefresh(withRT, 5*time.Minute))
+
+	refreshOnly := &Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"refresh_token": "refresh-token",
+		},
+	}
+	require.True(t, refresher.NeedsRefresh(refreshOnly, 5*time.Minute), "refresh_token-only imports must be refreshed before use")
+
+	noExpiresAt := &Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token":  "access-token",
+			"refresh_token": "refresh-token",
+		},
+	}
+	require.True(t, refresher.NeedsRefresh(noExpiresAt, 5*time.Minute), "missing expires_at must not leave an OAuth token unrefreshed")
 }
 
 func TestOpenAITokenProvider_NoRefreshTokenExpiredAccessTokenReturnsError(t *testing.T) {

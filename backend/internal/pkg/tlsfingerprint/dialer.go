@@ -5,12 +5,17 @@ package tlsfingerprint
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
+	"time"
 
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/proxy"
@@ -50,6 +55,15 @@ type HTTPProxyDialer struct {
 type SOCKS5ProxyDialer struct {
 	profile  *Profile
 	proxyURL *url.URL
+}
+
+const defaultProxyDialTimeout = 30 * time.Second
+
+var newHTTPSProxyTLSConfig = func(serverName string) *tls.Config {
+	return &tls.Config{
+		ServerName: serverName,
+		MinVersion: tls.VersionTLS12,
+	}
 }
 
 // Default TLS fingerprint values captured from Claude Code (Node.js 24.x)
@@ -138,9 +152,28 @@ func NewSOCKS5ProxyDialer(profile *Profile, proxyURL *url.URL) *SOCKS5ProxyDiale
 	return &SOCKS5ProxyDialer{profile: profile, proxyURL: proxyURL}
 }
 
+// ProfileCacheKey returns a stable key for the effective TLS ClientHello profile.
+func ProfileCacheKey(profile *Profile) string {
+	h := sha256.New()
+	writeCacheBool(h, "grease", profile != nil && profile.EnableGREASE && len(profile.Extensions) == 0)
+	writeCacheUint16s(h, "cipher_suites", effectiveCipherSuites(profile))
+	writeCacheUint16s(h, "curves", effectiveCurves(profile))
+	writeCacheUint16s(h, "point_formats", effectivePointFormats(profile))
+	writeCacheUint16s(h, "signature_algorithms", effectiveSignatureAlgorithms(profile))
+	writeCacheStrings(h, "alpn", effectiveALPNProtocols(profile))
+	writeCacheUint16s(h, "supported_versions", effectiveSupportedVersions(profile))
+	writeCacheUint16s(h, "key_share_groups", effectiveKeyShareGroups(profile))
+	writeCacheUint16s(h, "psk_modes", effectivePSKModes(profile))
+	writeCacheUint16s(h, "extensions", effectiveExtensionOrder(profile))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // DialTLSContext establishes a TLS connection through SOCKS5 proxy with the configured fingerprint.
 // Flow: SOCKS5 CONNECT to target -> TLS handshake with utls on the tunnel
 func (d *SOCKS5ProxyDialer) DialTLSContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	ctx, cancel := proxyDialContext(ctx)
+	defer cancel()
+
 	slog.Debug("tls_fingerprint_socks5_connecting", "proxy", d.proxyURL.Host, "target", addr)
 
 	// Step 1: Create SOCKS5 dialer
@@ -160,8 +193,10 @@ func (d *SOCKS5ProxyDialer) DialTLSContext(ctx context.Context, network, addr st
 		proxyAddr = net.JoinHostPort(d.proxyURL.Hostname(), "1080") // Default SOCKS5 port
 	}
 
-	socksDialer, err := proxy.SOCKS5("tcp", proxyAddr, auth, proxy.Direct)
+	forwardDialer := &deadlineProxyDialer{ctx: ctx, dialer: &net.Dialer{}}
+	socksDialer, err := proxy.SOCKS5("tcp", proxyAddr, auth, forwardDialer)
 	if err != nil {
+		forwardDialer.release(false)
 		slog.Debug("tls_fingerprint_socks5_dialer_failed", "error", err)
 		return nil, fmt.Errorf("create SOCKS5 dialer: %w", err)
 	}
@@ -169,11 +204,19 @@ func (d *SOCKS5ProxyDialer) DialTLSContext(ctx context.Context, network, addr st
 	// Step 2: Establish SOCKS5 tunnel to target
 	slog.Debug("tls_fingerprint_socks5_establishing_tunnel", "target", addr)
 	conn, err := socksDialer.Dial("tcp", addr)
+	forwardDialer.release(err != nil)
 	if err != nil {
 		slog.Debug("tls_fingerprint_socks5_connect_failed", "error", err)
 		return nil, fmt.Errorf("SOCKS5 connect: %w", err)
 	}
 	slog.Debug("tls_fingerprint_socks5_tunnel_established")
+
+	clearDeadline := applyContextDeadline(ctx, conn)
+	stopInterrupt := interruptConnOnContextDone(ctx, conn)
+	defer func() {
+		stopInterrupt()
+		clearDeadline()
+	}()
 
 	// Step 3: Perform TLS handshake on the tunnel with utls fingerprint
 	return performTLSHandshake(ctx, conn, d.profile, addr)
@@ -182,6 +225,9 @@ func (d *SOCKS5ProxyDialer) DialTLSContext(ctx context.Context, network, addr st
 // DialTLSContext establishes a TLS connection through HTTP proxy with the configured fingerprint.
 // Flow: TCP connect to proxy -> CONNECT tunnel -> TLS handshake with utls
 func (d *HTTPProxyDialer) DialTLSContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	ctx, cancel := proxyDialContext(ctx)
+	defer cancel()
+
 	slog.Debug("tls_fingerprint_http_proxy_connecting", "proxy", d.proxyURL.Host, "target", addr)
 
 	// Step 1: TCP connect to proxy server
@@ -204,6 +250,28 @@ func (d *HTTPProxyDialer) DialTLSContext(ctx context.Context, network, addr stri
 		return nil, fmt.Errorf("connect to proxy: %w", err)
 	}
 	slog.Debug("tls_fingerprint_http_proxy_connected", "proxy_addr", proxyAddr)
+
+	clearDeadline := applyContextDeadline(ctx, conn)
+	stopInterrupt := interruptConnOnContextDone(ctx, conn)
+	defer func() {
+		stopInterrupt()
+		clearDeadline()
+	}()
+
+	if d.proxyURL.Scheme == "https" {
+		proxyHost := d.proxyURL.Hostname()
+		if proxyHost == "" {
+			proxyHost = d.proxyURL.Host
+		}
+		tlsConn := tls.Client(conn, newHTTPSProxyTLSConfig(proxyHost))
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			_ = conn.Close()
+			slog.Debug("tls_fingerprint_https_proxy_handshake_failed", "error", err)
+			return nil, fmt.Errorf("TLS handshake with HTTPS proxy: %w", err)
+		}
+		conn = tlsConn
+		slog.Debug("tls_fingerprint_https_proxy_tls_established", "proxy_addr", proxyAddr)
+	}
 
 	// Step 2: Send CONNECT request to establish tunnel
 	req := &http.Request{
@@ -296,6 +364,192 @@ func performTLSHandshake(ctx context.Context, conn net.Conn, profile *Profile, a
 		"alpn", state.NegotiatedProtocol)
 
 	return tlsConn, nil
+}
+
+type deadlineProxyDialer struct {
+	ctx      context.Context
+	dialer   *net.Dialer
+	cleanups []deadlineProxyCleanup
+}
+
+type deadlineProxyCleanup struct {
+	conn    net.Conn
+	cleanup func()
+}
+
+func (d *deadlineProxyDialer) Dial(network, addr string) (net.Conn, error) {
+	conn, err := d.dialer.DialContext(d.ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	clearDeadline := applyContextDeadline(d.ctx, conn)
+	stopInterrupt := interruptConnOnContextDone(d.ctx, conn)
+	d.cleanups = append(d.cleanups, deadlineProxyCleanup{
+		conn: conn,
+		cleanup: func() {
+			stopInterrupt()
+			clearDeadline()
+		},
+	})
+	return conn, nil
+}
+
+func (d *deadlineProxyDialer) release(closeConns bool) {
+	for i := len(d.cleanups) - 1; i >= 0; i-- {
+		cleanup := d.cleanups[i]
+		cleanup.cleanup()
+		if closeConns {
+			_ = cleanup.conn.Close()
+		}
+	}
+	d.cleanups = nil
+}
+
+func proxyDialContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, defaultProxyDialTimeout)
+}
+
+func applyContextDeadline(ctx context.Context, conn net.Conn) func() {
+	deadline, ok := ctx.Deadline()
+	if !ok || conn == nil {
+		return func() {}
+	}
+	_ = conn.SetDeadline(deadline)
+	return func() {
+		_ = conn.SetDeadline(time.Time{})
+	}
+}
+
+func interruptConnOnContextDone(ctx context.Context, conn net.Conn) func() {
+	if ctx == nil || conn == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		select {
+		case <-ctx.Done():
+			_ = conn.SetDeadline(time.Now())
+		case <-done:
+		}
+	}()
+	return func() {
+		close(done)
+		<-stopped
+	}
+}
+
+func effectiveCipherSuites(profile *Profile) []uint16 {
+	if profile != nil && len(profile.CipherSuites) > 0 {
+		return profile.CipherSuites
+	}
+	return defaultCipherSuites
+}
+
+func effectiveCurves(profile *Profile) []uint16 {
+	if profile != nil && len(profile.Curves) > 0 {
+		return profile.Curves
+	}
+	return curvesToUint16s(defaultCurves)
+}
+
+func effectivePointFormats(profile *Profile) []uint16 {
+	if profile != nil && len(profile.PointFormats) > 0 {
+		return profile.PointFormats
+	}
+	return defaultPointFormats
+}
+
+func effectiveSignatureAlgorithms(profile *Profile) []uint16 {
+	if profile != nil && len(profile.SignatureAlgorithms) > 0 {
+		return profile.SignatureAlgorithms
+	}
+	return signatureSchemesToUint16s(defaultSignatureAlgorithms)
+}
+
+func effectiveALPNProtocols(profile *Profile) []string {
+	if profile != nil && len(profile.ALPNProtocols) > 0 {
+		return profile.ALPNProtocols
+	}
+	return []string{"http/1.1"}
+}
+
+func effectiveSupportedVersions(profile *Profile) []uint16 {
+	if profile != nil && len(profile.SupportedVersions) > 0 {
+		return profile.SupportedVersions
+	}
+	return []uint16{utls.VersionTLS13, utls.VersionTLS12}
+}
+
+func effectiveKeyShareGroups(profile *Profile) []uint16 {
+	if profile != nil && len(profile.KeyShareGroups) > 0 {
+		return profile.KeyShareGroups
+	}
+	return []uint16{uint16(utls.X25519)}
+}
+
+func effectivePSKModes(profile *Profile) []uint16 {
+	if profile != nil && len(profile.PSKModes) > 0 {
+		return profile.PSKModes
+	}
+	return []uint16{uint16(utls.PskModeDHE)}
+}
+
+func effectiveExtensionOrder(profile *Profile) []uint16 {
+	if profile != nil && len(profile.Extensions) > 0 {
+		return profile.Extensions
+	}
+	if profile != nil && profile.EnableGREASE {
+		extensions := make([]uint16, 0, len(defaultExtensionOrder)+2)
+		extensions = append(extensions, 0x0a0a)
+		extensions = append(extensions, defaultExtensionOrder...)
+		extensions = append(extensions, 0x0a0a)
+		return extensions
+	}
+	return defaultExtensionOrder
+}
+
+func curvesToUint16s(curves []utls.CurveID) []uint16 {
+	result := make([]uint16, len(curves))
+	for i, curve := range curves {
+		result[i] = uint16(curve)
+	}
+	return result
+}
+
+func signatureSchemesToUint16s(signatures []utls.SignatureScheme) []uint16 {
+	result := make([]uint16, len(signatures))
+	for i, signature := range signatures {
+		result[i] = uint16(signature)
+	}
+	return result
+}
+
+func writeCacheBool(w io.Writer, name string, value bool) {
+	fmt.Fprintf(w, "%s:%t;", name, value)
+}
+
+func writeCacheUint16s(w io.Writer, name string, values []uint16) {
+	fmt.Fprintf(w, "%s:%d:", name, len(values))
+	for _, value := range values {
+		fmt.Fprintf(w, "%04x,", value)
+	}
+	fmt.Fprint(w, ";")
+}
+
+func writeCacheStrings(w io.Writer, name string, values []string) {
+	fmt.Fprintf(w, "%s:%d:", name, len(values))
+	for _, value := range values {
+		fmt.Fprintf(w, "%d:%s,", len(value), value)
+	}
+	fmt.Fprint(w, ";")
 }
 
 // toUTLSCurves converts uint16 slice to utls.CurveID slice.

@@ -618,7 +618,7 @@ func TestShouldKeepIngressPreviousResponseID(t *testing.T) {
 		require.Equal(t, "strict_incremental_ok", reason)
 	})
 
-	t.Run("function_call_output_keeps_previous_response_id", func(t *testing.T) {
+	t.Run("function_call_output_requires_chained_previous_response_id", func(t *testing.T) {
 		payload := []byte(`{
 			"type":"response.create",
 			"model":"gpt-5.1",
@@ -628,8 +628,22 @@ func TestShouldKeepIngressPreviousResponseID(t *testing.T) {
 		}`)
 		keep, reason, err := shouldKeepIngressPreviousResponseID(previousPayload, payload, "resp_turn_1", true)
 		require.NoError(t, err)
+		require.False(t, keep)
+		require.Equal(t, "previous_response_id_mismatch", reason)
+	})
+
+	t.Run("function_call_output_keeps_chained_previous_response_id", func(t *testing.T) {
+		payload := []byte(`{
+			"type":"response.create",
+			"model":"gpt-5.1",
+			"store":false,
+			"previous_response_id":"resp_turn_1",
+			"input":[{"type":"function_call_output","call_id":"call_1","output":"ok"}]
+		}`)
+		keep, reason, err := shouldKeepIngressPreviousResponseID(previousPayload, payload, "resp_turn_1", true)
+		require.NoError(t, err)
 		require.True(t, keep)
-		require.Equal(t, "has_function_call_output", reason)
+		require.Equal(t, "has_function_call_output_chained", reason)
 	})
 
 	t.Run("non_input_compare_error", func(t *testing.T) {

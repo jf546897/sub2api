@@ -265,6 +265,8 @@ type AccountUsageService struct {
 	antigravityQuotaFetcher *AntigravityQuotaFetcher
 	cache                   *UsageCache
 	identityCache           IdentityCache
+	httpUpstream            HTTPUpstream
+	openAITokenProvider     *OpenAITokenProvider
 	tlsFPProfileService     *TLSFingerprintProfileService
 }
 
@@ -277,6 +279,8 @@ func NewAccountUsageService(
 	antigravityQuotaFetcher *AntigravityQuotaFetcher,
 	cache *UsageCache,
 	identityCache IdentityCache,
+	httpUpstream HTTPUpstream,
+	openAITokenProvider *OpenAITokenProvider,
 	tlsFPProfileService *TLSFingerprintProfileService,
 ) *AccountUsageService {
 	return &AccountUsageService{
@@ -287,6 +291,8 @@ func NewAccountUsageService(
 		antigravityQuotaFetcher: antigravityQuotaFetcher,
 		cache:                   cache,
 		identityCache:           identityCache,
+		httpUpstream:            httpUpstream,
+		openAITokenProvider:     openAITokenProvider,
 		tlsFPProfileService:     tlsFPProfileService,
 	}
 }
@@ -607,9 +613,9 @@ func (s *AccountUsageService) probeOpenAICodexSnapshot(ctx context.Context, acco
 	if account == nil || !account.IsOAuth() {
 		return nil, nil
 	}
-	accessToken := account.GetOpenAIAccessToken()
-	if accessToken == "" {
-		return nil, fmt.Errorf("no access token available")
+	accessToken, err := s.openAICodexProbeAccessToken(ctx, account)
+	if err != nil {
+		return nil, err
 	}
 	modelID := openaipkg.DefaultTestModel
 	payload := createOpenAITestPayload(modelID, true)
@@ -645,6 +651,29 @@ func (s *AccountUsageService) probeOpenAICodexSnapshot(ctx context.Context, acco
 	if account.ProxyID != nil && account.Proxy != nil {
 		proxyURL = account.Proxy.URL()
 	}
+	if s != nil && s.httpUpstream != nil {
+		resp, err := s.httpUpstream.DoWithTLS(
+			req,
+			proxyURL,
+			account.ID,
+			account.Concurrency,
+			s.tlsFPProfileService.ResolveTLSProfile(account),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("openai codex probe request failed: %w", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		updates, err := extractOpenAICodexProbeUpdates(resp)
+		if err != nil {
+			return nil, err
+		}
+		if len(updates) > 0 {
+			s.persistOpenAICodexProbeSnapshot(account.ID, updates)
+			return updates, nil
+		}
+		return nil, nil
+	}
+
 	client, err := httppool.GetClient(httppool.Options{
 		ProxyURL:              proxyURL,
 		Timeout:               15 * time.Second,
@@ -668,6 +697,34 @@ func (s *AccountUsageService) probeOpenAICodexSnapshot(ctx context.Context, acco
 		return updates, nil
 	}
 	return nil, nil
+}
+
+func (s *AccountUsageService) openAICodexProbeAccessToken(ctx context.Context, account *Account) (string, error) {
+	if account == nil {
+		return "", fmt.Errorf("account is nil")
+	}
+	if s != nil && s.openAITokenProvider != nil {
+		accessToken, err := s.openAITokenProvider.GetAccessToken(ctx, account)
+		if err != nil {
+			return "", err
+		}
+		accessToken = strings.TrimSpace(accessToken)
+		if accessToken == "" {
+			return "", fmt.Errorf("no access token available")
+		}
+		return accessToken, nil
+	}
+
+	expiresAt := account.GetCredentialAsTime("expires_at")
+	hasRefreshToken := strings.TrimSpace(account.GetOpenAIRefreshToken()) != ""
+	if hasRefreshToken && (expiresAt == nil || !time.Now().Before(*expiresAt)) {
+		return "", fmt.Errorf("openai access token expired; refresh required before codex probe")
+	}
+	accessToken := strings.TrimSpace(account.GetOpenAIAccessToken())
+	if accessToken == "" {
+		return "", fmt.Errorf("no access token available")
+	}
+	return accessToken, nil
 }
 
 func (s *AccountUsageService) persistOpenAICodexProbeSnapshot(accountID int64, updates map[string]any) {

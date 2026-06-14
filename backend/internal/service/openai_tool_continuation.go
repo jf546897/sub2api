@@ -53,6 +53,26 @@ func isCodexToolCallOutputItemType(typ string) bool {
 // NeedsToolContinuation 判定请求是否需要工具调用续链处理。
 // 满足以下任一信号即视为续链：previous_response_id、input 内包含工具输出/item_reference、
 // 或显式声明 tools/tool_choice。
+func forEachInputItem(reqBody map[string]any, visit func(map[string]any) bool) {
+	if reqBody == nil || visit == nil {
+		return
+	}
+	switch input := reqBody["input"].(type) {
+	case []any:
+		for _, item := range input {
+			itemMap, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if !visit(itemMap) {
+				return
+			}
+		}
+	case map[string]any:
+		visit(input)
+	}
+}
+
 func NeedsToolContinuation(reqBody map[string]any) bool {
 	if reqBody == nil {
 		return false
@@ -66,21 +86,16 @@ func NeedsToolContinuation(reqBody map[string]any) bool {
 	if hasToolChoiceSignal(reqBody) {
 		return true
 	}
-	input, ok := reqBody["input"].([]any)
-	if !ok {
-		return false
-	}
-	for _, item := range input {
-		itemMap, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
+	found := false
+	forEachInputItem(reqBody, func(itemMap map[string]any) bool {
 		itemType, _ := itemMap["type"].(string)
 		if isCodexToolCallItemType(itemType) || itemType == "item_reference" {
-			return true
+			found = true
+			return false
 		}
-	}
-	return false
+		return true
+	})
+	return found
 }
 
 // AnalyzeToolContinuationSignals 单次遍历 input，提取工具输出/工具调用上下文/item_reference 相关信号。
@@ -91,19 +106,10 @@ func AnalyzeToolContinuationSignals(reqBody map[string]any) ToolContinuationSign
 	if reqBody == nil {
 		return signals
 	}
-	input, ok := reqBody["input"].([]any)
-	if !ok {
-		return signals
-	}
-
 	var callIDs map[string]struct{}
 	var referenceIDs map[string]struct{}
 
-	for _, item := range input {
-		itemMap, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
+	forEachInputItem(reqBody, func(itemMap map[string]any) bool {
 		itemType, _ := itemMap["type"].(string)
 		switch {
 		case isCodexToolCallContextItemType(itemType):
@@ -117,7 +123,7 @@ func AnalyzeToolContinuationSignals(reqBody map[string]any) ToolContinuationSign
 			callID = strings.TrimSpace(callID)
 			if callID == "" {
 				signals.HasFunctionCallOutputMissingCallID = true
-				continue
+				return true
 			}
 			if callIDs == nil {
 				callIDs = make(map[string]struct{})
@@ -128,14 +134,15 @@ func AnalyzeToolContinuationSignals(reqBody map[string]any) ToolContinuationSign
 			idValue, _ := itemMap["id"].(string)
 			idValue = strings.TrimSpace(idValue)
 			if idValue == "" {
-				continue
+				return true
 			}
 			if referenceIDs == nil {
 				referenceIDs = make(map[string]struct{})
 			}
 			referenceIDs[idValue] = struct{}{}
 		}
-	}
+		return true
+	})
 
 	if len(callIDs) == 0 {
 		return signals
@@ -162,15 +169,15 @@ func ValidateFunctionCallOutputContextBytes(body []byte) FunctionCallOutputValid
 	}
 	// handler 热路径只读扫描 input，避免 GetBytes 为大 Responses body 复制整段 JSON。
 	input := parseRawJSONView(body).Get("input")
-	if !input.IsArray() {
+	if !input.Exists() {
 		return result
 	}
 
 	var callIDs map[string]struct{}
 	var referenceIDs map[string]struct{}
-	input.ForEach(func(_, item gjson.Result) bool {
+	scanItem := func(item gjson.Result) {
 		if !item.IsObject() {
-			return true
+			return
 		}
 		itemType := item.Get("type").String()
 		switch {
@@ -179,7 +186,7 @@ func ValidateFunctionCallOutputContextBytes(body []byte) FunctionCallOutputValid
 			callID := strings.TrimSpace(item.Get("call_id").String())
 			if callID == "" {
 				result.HasFunctionCallOutputMissingCallID = true
-				return true
+				return
 			}
 			if callIDs == nil {
 				callIDs = make(map[string]struct{})
@@ -192,16 +199,23 @@ func ValidateFunctionCallOutputContextBytes(body []byte) FunctionCallOutputValid
 		case itemType == "item_reference":
 			idValue := strings.TrimSpace(item.Get("id").String())
 			if idValue == "" {
-				return true
+				return
 			}
 			if referenceIDs == nil {
 				referenceIDs = make(map[string]struct{})
 			}
 			referenceIDs[idValue] = struct{}{}
 		}
-		return !result.HasFunctionCallOutput || !result.HasToolCallContext
-	})
-	if !result.HasFunctionCallOutput || result.HasToolCallContext || len(callIDs) == 0 || len(referenceIDs) == 0 {
+	}
+	if input.IsArray() {
+		input.ForEach(func(_, item gjson.Result) bool {
+			scanItem(item)
+			return true
+		})
+	} else {
+		scanItem(input)
+	}
+	if !result.HasFunctionCallOutput || result.HasFunctionCallOutputMissingCallID || len(callIDs) == 0 || len(referenceIDs) == 0 {
 		return result
 	}
 	allReferenced := true
@@ -221,78 +235,13 @@ func ValidateFunctionCallOutputContextBytes(body []byte) FunctionCallOutputValid
 // 3) 仅在无工具上下文时才构建 call_id / item_reference 集合
 // 字段名保留 FunctionCallOutput 是为了兼容既有调用点；语义覆盖所有 Codex 工具输出。
 func ValidateFunctionCallOutputContext(reqBody map[string]any) FunctionCallOutputValidation {
-	result := FunctionCallOutputValidation{}
-	if reqBody == nil {
-		return result
+	signals := AnalyzeToolContinuationSignals(reqBody)
+	return FunctionCallOutputValidation{
+		HasFunctionCallOutput:              signals.HasFunctionCallOutput,
+		HasToolCallContext:                 signals.HasToolCallContext,
+		HasFunctionCallOutputMissingCallID: signals.HasFunctionCallOutputMissingCallID,
+		HasItemReferenceForAllCallIDs:      signals.HasItemReferenceForAllCallIDs,
 	}
-	input, ok := reqBody["input"].([]any)
-	if !ok {
-		return result
-	}
-
-	for _, item := range input {
-		itemMap, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		itemType, _ := itemMap["type"].(string)
-		switch {
-		case isCodexToolCallOutputItemType(itemType):
-			result.HasFunctionCallOutput = true
-		case isCodexToolCallContextItemType(itemType):
-			callID, _ := itemMap["call_id"].(string)
-			if strings.TrimSpace(callID) != "" {
-				result.HasToolCallContext = true
-			}
-		}
-		if result.HasFunctionCallOutput && result.HasToolCallContext {
-			return result
-		}
-	}
-
-	if !result.HasFunctionCallOutput || result.HasToolCallContext {
-		return result
-	}
-
-	callIDs := make(map[string]struct{})
-	referenceIDs := make(map[string]struct{})
-	for _, item := range input {
-		itemMap, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		itemType, _ := itemMap["type"].(string)
-		switch {
-		case isCodexToolCallOutputItemType(itemType):
-			callID, _ := itemMap["call_id"].(string)
-			callID = strings.TrimSpace(callID)
-			if callID == "" {
-				result.HasFunctionCallOutputMissingCallID = true
-				continue
-			}
-			callIDs[callID] = struct{}{}
-		case itemType == "item_reference":
-			idValue, _ := itemMap["id"].(string)
-			idValue = strings.TrimSpace(idValue)
-			if idValue == "" {
-				continue
-			}
-			referenceIDs[idValue] = struct{}{}
-		}
-	}
-
-	if len(callIDs) == 0 || len(referenceIDs) == 0 {
-		return result
-	}
-	allReferenced := true
-	for callID := range callIDs {
-		if _, ok := referenceIDs[callID]; !ok {
-			allReferenced = false
-			break
-		}
-	}
-	result.HasItemReferenceForAllCallIDs = allReferenced
-	return result
 }
 
 // HasFunctionCallOutput 判断 input 是否包含任意 Codex 工具输出，用于触发续链校验。
@@ -324,27 +273,20 @@ func HasItemReferenceForCallIDs(reqBody map[string]any, callIDs []string) bool {
 	if reqBody == nil || len(callIDs) == 0 {
 		return false
 	}
-	input, ok := reqBody["input"].([]any)
-	if !ok {
-		return false
-	}
 	referenceIDs := make(map[string]struct{})
-	for _, item := range input {
-		itemMap, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
+	forEachInputItem(reqBody, func(itemMap map[string]any) bool {
 		itemType, _ := itemMap["type"].(string)
 		if itemType != "item_reference" {
-			continue
+			return true
 		}
 		idValue, _ := itemMap["id"].(string)
 		idValue = strings.TrimSpace(idValue)
 		if idValue == "" {
-			continue
+			return true
 		}
 		referenceIDs[idValue] = struct{}{}
-	}
+		return true
+	})
 	if len(referenceIDs) == 0 {
 		return false
 	}

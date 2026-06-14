@@ -113,6 +113,10 @@ func RunCLI() error {
 
 	fmt.Println()
 	fmt.Print("Testing database connection... ")
+	if err := ensureDataDir(); err != nil {
+		fmt.Println("FAILED")
+		return fmt.Errorf("data directory unavailable: %w", err)
+	}
 	if err := TestDatabaseConnection(&cfg.Database); err != nil {
 		fmt.Println("FAILED")
 		return fmt.Errorf("database connection failed: %w", err)

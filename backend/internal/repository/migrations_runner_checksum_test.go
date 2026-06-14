@@ -1,6 +1,11 @@
 package repository
 
 import (
+	"crypto/sha256"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -153,6 +158,24 @@ func TestIsMigrationChecksumCompatible(t *testing.T) {
 		}
 	})
 
+	t.Run("033历史checksum兼容当前文件", func(t *testing.T) {
+		ok := isMigrationChecksumCompatible(
+			"033_ops_monitoring_vnext.sql",
+			"accf363544d187aecad4f1c68fe34118f86d1a931465e66490c530d3f3f1106d",
+			"c2a190d7e94fdb54e0b37796bc2a07bf98483cf0e1af390ac7973fe245b298a9",
+		)
+		require.True(t, ok)
+	})
+
+	t.Run("136历史checksum兼容当前文件", func(t *testing.T) {
+		ok := isMigrationChecksumCompatible(
+			"136_remove_ops_retry_replay.sql",
+			"08d6ff6a5ad1d2d4d16f9cdd4c5259cc7984b7363e46a91e32c12d56c8ec4f90",
+			"e951571a537a71f3997a33ba546a20e40c36f090d846092bf1a3c8af69c9b378",
+		)
+		require.True(t, ok)
+	})
+
 	t.Run("119未知checksum不兼容", func(t *testing.T) {
 		ok := isMigrationChecksumCompatible(
 			"119_enforce_payment_orders_out_trade_no_unique.sql",
@@ -161,4 +184,22 @@ func TestIsMigrationChecksumCompatible(t *testing.T) {
 		)
 		require.False(t, ok)
 	})
+}
+
+func TestMigrationChecksumCompatibilityRulesMatchCurrentFiles(t *testing.T) {
+	for _, name := range []string{
+		"033_ops_monitoring_vnext.sql",
+		"136_remove_ops_retry_replay.sql",
+	} {
+		t.Run(name, func(t *testing.T) {
+			content, err := os.ReadFile(filepath.Join("..", "..", "migrations", name))
+			require.NoError(t, err)
+
+			sum := sha256.Sum256([]byte(strings.TrimSpace(string(content))))
+			checksum := fmt.Sprintf("%x", sum)
+			rule, ok := migrationChecksumCompatibilityRules[name]
+			require.True(t, ok)
+			require.Equal(t, checksum, rule.fileChecksum)
+		})
+	}
 }

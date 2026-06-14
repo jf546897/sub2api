@@ -252,7 +252,13 @@ func (s *CRSSyncService) SyncFromCRS(ctx context.Context, input SyncFromCRSInput
 
 	var proxies []Proxy
 	if input.SyncProxies {
-		proxies, _ = s.proxyRepo.ListActive(ctx)
+		if s.proxyRepo == nil {
+			return nil, errors.New("proxy sync requested but proxy repository is not configured")
+		}
+		proxies, err = s.proxyRepo.ListActive(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list active proxies failed: %w", err)
+		}
 	}
 
 	// Claude OAuth / Setup Token -> sub2api anthropic oauth/setup-token
@@ -526,10 +532,9 @@ func (s *CRSSyncService) SyncFromCRS(ctx context.Context, input SyncFromCRSInput
 			Name:         src.Name,
 		}
 
-		accessToken, _ := src.Credentials["access_token"].(string)
-		if strings.TrimSpace(accessToken) == "" {
+		if !hasCRSOpenAIRefreshToken(src.Credentials) {
 			item.Action = "failed"
-			item.Error = "missing access_token"
+			item.Error = "missing refresh_token"
 			result.Failed++
 			result.Items = append(result.Items, item)
 			continue
@@ -1023,6 +1028,9 @@ func (s *CRSSyncService) mapOrCreateProxy(ctx context.Context, enabled bool, cac
 	if !enabled || src == nil {
 		return nil, nil
 	}
+	if cached == nil {
+		return nil, errors.New("proxy cache is not configured")
+	}
 	protocol := strings.ToLower(strings.TrimSpace(src.Protocol))
 	switch protocol {
 	case "socks":
@@ -1035,11 +1043,17 @@ func (s *CRSSyncService) mapOrCreateProxy(ctx context.Context, enabled bool, cac
 	username := strings.TrimSpace(src.Username)
 	password := strings.TrimSpace(src.Password)
 
-	if protocol == "" || host == "" || port <= 0 {
-		return nil, nil
+	if protocol == "" {
+		return nil, errors.New("proxy protocol is required")
+	}
+	if host == "" {
+		return nil, errors.New("proxy host is required")
+	}
+	if port <= 0 {
+		return nil, errors.New("proxy port is required")
 	}
 	if protocol != "http" && protocol != "https" && protocol != "socks5" {
-		return nil, nil
+		return nil, fmt.Errorf("unsupported proxy protocol: %s", protocol)
 	}
 
 	// Find existing proxy (active only).
@@ -1052,6 +1066,10 @@ func (s *CRSSyncService) mapOrCreateProxy(ctx context.Context, enabled bool, cac
 			id := p.ID
 			return &id, nil
 		}
+	}
+
+	if s.proxyRepo == nil {
+		return nil, errors.New("proxy repository is not configured")
 	}
 
 	// Create new proxy
@@ -1079,6 +1097,11 @@ func defaultProxyName(base, protocol, host string, port int) string {
 		base = "crs"
 	}
 	return fmt.Sprintf("%s (%s://%s:%d)", base, protocol, host, port)
+}
+
+func hasCRSOpenAIRefreshToken(credentials map[string]any) bool {
+	refreshToken, ok := credentials["refresh_token"].(string)
+	return ok && strings.TrimSpace(refreshToken) != ""
 }
 
 func defaultName(name, id string) string {
@@ -1257,6 +1280,9 @@ func (s *CRSSyncService) refreshOAuthToken(ctx context.Context, account *Account
 			}
 		}
 	case PlatformOpenAI:
+		if !shouldRefreshOpenAIAfterCRSSync(account.Extra) {
+			return nil
+		}
 		if s.openaiOAuthService == nil {
 			return nil
 		}

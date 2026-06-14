@@ -478,7 +478,7 @@ func TestOpenAITokenProvider_MissingAccessToken(t *testing.T) {
 
 	token, err := provider.GetAccessToken(context.Background(), account)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "access_token not found")
+	require.Contains(t, err.Error(), "access_token missing and refresh_token is missing")
 	require.Empty(t, token)
 }
 
@@ -513,6 +513,70 @@ func TestOpenAITokenProvider_RefreshError(t *testing.T) {
 	token, err := provider.GetAccessToken(context.Background(), account)
 	require.NoError(t, err)
 	require.Equal(t, "old-token", token) // Fallback to existing token
+}
+
+func TestOpenAITokenProvider_Real_RefreshSuccessReturnsNewToken(t *testing.T) {
+	cache := newOpenAITokenCacheStub()
+	expiresAt := time.Now().Add(1 * time.Minute).UTC().Format(time.RFC3339)
+	refreshedExpiresAt := time.Now().Add(1 * time.Hour).UTC().Format(time.RFC3339)
+	account := &Account{
+		ID:       211,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token":  "old-token",
+			"refresh_token": "old-refresh-token",
+			"expires_at":    expiresAt,
+		},
+	}
+	repo := &refreshAPIAccountRepo{account: account}
+	executor := &refreshAPIExecutorStub{
+		needsRefresh: true,
+		credentials: map[string]any{
+			"access_token":  "refreshed-token",
+			"refresh_token": "new-refresh-token",
+			"expires_at":    refreshedExpiresAt,
+		},
+	}
+	api := NewOAuthRefreshAPI(repo, cache)
+	provider := NewOpenAITokenProvider(repo, cache, nil)
+	provider.SetRefreshAPI(api, executor)
+
+	token, err := provider.GetAccessToken(context.Background(), account)
+	require.NoError(t, err)
+	require.Equal(t, "refreshed-token", token)
+	require.Equal(t, "refreshed-token", cache.tokens[OpenAITokenCacheKey(account)])
+	require.Equal(t, 1, executor.refreshCalls)
+}
+
+func TestOpenAITokenProvider_Real_RefreshErrorDoesNotUseOldToken(t *testing.T) {
+	cache := newOpenAITokenCacheStub()
+	expiresAt := time.Now().Add(1 * time.Minute).UTC().Format(time.RFC3339)
+	account := &Account{
+		ID:       212,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token":  "old-token",
+			"refresh_token": "old-refresh-token",
+			"expires_at":    expiresAt,
+		},
+	}
+	repo := &refreshAPIAccountRepo{account: account}
+	executor := &refreshAPIExecutorStub{
+		needsRefresh: true,
+		err:          errors.New("invalid_grant: token revoked"),
+	}
+	api := NewOAuthRefreshAPI(repo, cache)
+	provider := NewOpenAITokenProvider(repo, cache, nil)
+	provider.SetRefreshAPI(api, executor)
+
+	token, err := provider.GetAccessToken(context.Background(), account)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid_grant")
+	require.Empty(t, token)
+	require.Empty(t, cache.tokens[OpenAITokenCacheKey(account)])
+	require.Equal(t, 1, executor.refreshCalls)
 }
 
 func TestOpenAITokenProvider_OAuthServiceNotConfigured(t *testing.T) {
@@ -786,7 +850,7 @@ func TestOpenAITokenProvider_Real_WhitespaceCredentialToken(t *testing.T) {
 	provider := NewOpenAITokenProvider(nil, cache, nil)
 	token, err := provider.GetAccessToken(context.Background(), account)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "access_token not found")
+	require.Contains(t, err.Error(), "access_token missing and refresh_token is missing")
 	require.Empty(t, token)
 }
 
@@ -807,7 +871,7 @@ func TestOpenAITokenProvider_Real_NilCredentials(t *testing.T) {
 	provider := NewOpenAITokenProvider(nil, cache, nil)
 	token, err := provider.GetAccessToken(context.Background(), account)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "access_token not found")
+	require.Contains(t, err.Error(), "access_token missing and refresh_token is missing")
 	require.Empty(t, token)
 }
 
@@ -839,6 +903,31 @@ func TestOpenAITokenProvider_Real_LockRace_PollingHitsCache(t *testing.T) {
 	token, err := provider.GetAccessToken(context.Background(), account)
 	require.NoError(t, err)
 	require.Equal(t, "winner-token", token)
+}
+
+func TestOpenAITokenProvider_Real_LockRaceWaitMissDoesNotUseOldToken(t *testing.T) {
+	cache := newOpenAITokenCacheStub()
+	cache.lockAcquired = false
+
+	expiresAt := time.Now().Add(1 * time.Minute).Format(time.RFC3339)
+	account := &Account{
+		ID:       213,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token":  "fallback-token",
+			"refresh_token": "refresh-token",
+			"expires_at":    expiresAt,
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	provider := NewOpenAITokenProvider(nil, cache, nil)
+	token, err := provider.GetAccessToken(ctx, account)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "lock held and no refreshed token")
+	require.Empty(t, token)
 }
 
 func TestOpenAITokenProvider_Real_LockRace_ContextCanceled(t *testing.T) {
@@ -923,12 +1012,50 @@ func TestOpenAITokenProvider_RuntimeMetrics_LockAcquireFailure(t *testing.T) {
 	}
 
 	provider := NewOpenAITokenProvider(nil, cache, nil)
-	_, err := provider.GetAccessToken(context.Background(), account)
-	require.NoError(t, err)
+	token, err := provider.GetAccessToken(context.Background(), account)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "refresh did not complete")
+	require.Empty(t, token)
 
 	metrics := provider.SnapshotRuntimeMetrics()
 	require.GreaterOrEqual(t, metrics.LockAcquireFailure, int64(1))
 	require.GreaterOrEqual(t, metrics.RefreshRequests, int64(1))
+}
+
+func TestOpenAITokenProvider_CacheHitChecksTokenVersion(t *testing.T) {
+	cache := newOpenAITokenCacheStub()
+	expiresAt := time.Now().Add(1 * time.Hour).UTC().Format(time.RFC3339)
+	staleAccount := &Account{
+		ID:       214,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token":   "stale-db-token",
+			"expires_at":     expiresAt,
+			"_token_version": int64(100),
+		},
+	}
+	latestAccount := &Account{
+		ID:       214,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token":   "fresh-imported-token",
+			"expires_at":     expiresAt,
+			"_token_version": int64(200),
+		},
+	}
+	cacheKey := OpenAITokenCacheKey(staleAccount)
+	cache.tokens[cacheKey] = "stale-cached-token"
+	repo := &mockAccountRepoForGemini{
+		accountsByID: map[int64]*Account{latestAccount.ID: latestAccount},
+	}
+	provider := NewOpenAITokenProvider(repo, cache, nil)
+
+	token, err := provider.GetAccessToken(context.Background(), staleAccount)
+	require.NoError(t, err)
+	require.Equal(t, "fresh-imported-token", token)
+	require.Equal(t, "fresh-imported-token", cache.tokens[cacheKey])
 }
 
 func TestOpenAITokenProvider_NoRefreshTokenExpired_DisablesAccount(t *testing.T) {

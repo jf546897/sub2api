@@ -281,7 +281,22 @@ func (h *AccountHandler) importCodexSessions(ctx context.Context, req CodexSessi
 				continue
 			}
 			if h.tokenCacheInvalidator != nil && updated != nil {
-				_ = h.tokenCacheInvalidator.InvalidateToken(ctx, updated)
+				if err := h.tokenCacheInvalidator.InvalidateToken(ctx, updated); err != nil {
+					result.Failed++
+					message := "account updated, but token cache invalidation failed: " + err.Error()
+					result.Items = append(result.Items, CodexSessionImportItem{
+						Index:   entry.Index,
+						Name:    accountName,
+						Action:  "failed",
+						Message: message,
+					})
+					result.Errors = append(result.Errors, CodexSessionImportMessage{
+						Index:   entry.Index,
+						Name:    accountName,
+						Message: message,
+					})
+					continue
+				}
 			}
 			result.Updated++
 			accountID := existing.ID
@@ -482,6 +497,12 @@ func normalizeCodexImportEntry(entry codexImportEntry) (*codexImportAccount, err
 		item.RefreshToken = firstCodexString(raw,
 			[]string{"tokens", "refresh_token"},
 			[]string{"tokens", "refreshToken"},
+			[]string{"oauth", "refresh_token"},
+			[]string{"oauth", "refreshToken"},
+			[]string{"auth", "refresh_token"},
+			[]string{"auth", "refreshToken"},
+			[]string{"openai", "refresh_token"},
+			[]string{"openai", "refreshToken"},
 			[]string{"refresh_token"},
 			[]string{"refreshToken"},
 		)
@@ -557,6 +578,7 @@ func normalizeCodexImportEntry(entry codexImportEntry) (*codexImportAccount, err
 		return nil, errors.New("缺少 accessToken/access_token")
 	}
 	item.Credentials["access_token"] = item.AccessToken
+	item.Credentials["_token_version"] = now.UnixMilli()
 	if item.RefreshToken != "" {
 		item.Credentials["refresh_token"] = item.RefreshToken
 		item.Credentials["client_id"] = openai.ClientID
@@ -892,12 +914,12 @@ func mergeCodexImportCredentials(existing, incoming map[string]any, item *codexI
 	if item == nil {
 		return out
 	}
+	if strings.TrimSpace(item.IDToken) == "" {
+		delete(out, "id_token")
+	}
 	if strings.TrimSpace(item.RefreshToken) == "" {
 		delete(out, "refresh_token")
 		delete(out, "client_id")
-	}
-	if strings.TrimSpace(item.IDToken) == "" {
-		delete(out, "id_token")
 	}
 	return out
 }

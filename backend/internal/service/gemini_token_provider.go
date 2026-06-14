@@ -116,11 +116,10 @@ func (p *GeminiTokenProvider) GetAccessToken(ctx context.Context, account *Accou
 			return accessToken, nil
 		}
 
-		var proxyURL string
-		if account.ProxyID != nil && p.geminiOAuthService.proxyRepo != nil {
-			if proxy, err := p.geminiOAuthService.proxyRepo.GetByID(ctx, *account.ProxyID); err == nil && proxy != nil {
-				proxyURL = proxy.URL()
-			}
+		proxyURL, err := resolveGeminiProxyURL(ctx, p.geminiOAuthService.proxyRepo, account.ProxyID)
+		if err != nil {
+			slog.Warn("gemini_project_auto_detect_proxy_unavailable", "account_id", account.ID, "error", err)
+			return accessToken, nil
 		}
 
 		detected, tierID, err := p.geminiOAuthService.fetchProjectID(ctx, accessToken, proxyURL)

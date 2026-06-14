@@ -51,6 +51,44 @@ func newJSONResponse(status int, body string) *http.Response {
 	}
 }
 
+func TestAccountTestService_OpenAITestAccessTokenUsesCurrentLegacyToken(t *testing.T) {
+	t.Parallel()
+
+	expiresAt := time.Now().Add(time.Hour)
+	account := &Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token": " access_current ",
+			"expires_at":   expiresAt.Format(time.RFC3339),
+		},
+	}
+
+	token, err := (&AccountTestService{}).openAITestAccessToken(context.Background(), account)
+	require.NoError(t, err)
+	require.Equal(t, "access_current", token)
+}
+
+func TestAccountTestService_OpenAITestAccessTokenBlocksExpiredRefreshableTokenWithoutProvider(t *testing.T) {
+	t.Parallel()
+
+	expiresAt := time.Now().Add(-time.Minute)
+	account := &Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token":  "expired_access",
+			"refresh_token": "refresh_present",
+			"expires_at":    expiresAt.Format(time.RFC3339),
+		},
+	}
+
+	token, err := (&AccountTestService{}).openAITestAccessToken(context.Background(), account)
+	require.Error(t, err)
+	require.Empty(t, token)
+	require.Contains(t, err.Error(), "requires refresh")
+}
+
 // --- test functions ---
 
 func newTestContext() (*gin.Context, *httptest.ResponseRecorder) {

@@ -88,11 +88,11 @@ type AdminService interface {
 	RefreshAccountCredentials(ctx context.Context, id int64) (*Account, error)
 	ClearAccountError(ctx context.Context, id int64) (*Account, error)
 	SetAccountError(ctx context.Context, id int64, errorMsg string) error
-	// EnsureOpenAIPrivacy 检查 OpenAI OAuth 账号 privacy_mode，未设置则尝试关闭训练数据共享并持久化。
+	// EnsureOpenAIPrivacy 仅在账号 Extra 显式 opt-in 后，自动检查并设置 OpenAI OAuth 隐私。
 	EnsureOpenAIPrivacy(ctx context.Context, account *Account) string
 	// EnsureAntigravityPrivacy 检查 Antigravity OAuth 账号 privacy_mode，未设置则调用 setUserSettings 并持久化。
 	EnsureAntigravityPrivacy(ctx context.Context, account *Account) string
-	// ForceOpenAIPrivacy 强制重新设置 OpenAI OAuth 账号隐私，无论当前状态。
+	// ForceOpenAIPrivacy 手动强制重新设置 OpenAI OAuth 账号隐私；仅供显式用户操作调用。
 	ForceOpenAIPrivacy(ctx context.Context, account *Account) string
 	// ForceAntigravityPrivacy 强制重新设置 Antigravity OAuth 账号隐私，无论当前状态。
 	ForceAntigravityPrivacy(ctx context.Context, account *Account) string
@@ -2647,18 +2647,20 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 	}
 
 	// OAuth 账号：创建后异步设置隐私。
-	// 使用 Ensure（幂等）而非 Force：新建账号 Extra 为空时效果相同，但更安全。
+	// OpenAI 默认不在新建后后台触网；仅 Extra 显式开启时执行幂等隐私设置。
 	if account.Type == AccountTypeOAuth {
 		switch account.Platform {
 		case PlatformOpenAI:
-			go func() {
-				defer func() {
-					if r := recover(); r != nil {
-						slog.Error("create_account_openai_privacy_panic", "account_id", account.ID, "recover", r)
-					}
+			if shouldAutoEnsureOpenAIPrivacy(account.Extra) {
+				go func() {
+					defer func() {
+						if r := recover(); r != nil {
+							slog.Error("create_account_openai_privacy_panic", "account_id", account.ID, "recover", r)
+						}
+					}()
+					s.EnsureOpenAIPrivacy(context.Background(), account)
 				}()
-				s.EnsureOpenAIPrivacy(context.Background(), account)
-			}()
+			}
 		case PlatformAntigravity:
 			go func() {
 				defer func() {
@@ -3838,13 +3840,15 @@ func (s *adminServiceImpl) ResetAccountQuota(ctx context.Context, id int64) erro
 	return s.accountRepo.ResetQuotaUsed(ctx, id)
 }
 
-// EnsureOpenAIPrivacy 检查 OpenAI OAuth 账号是否已设置 privacy_mode，
-// 未设置则调用 disableOpenAITraining 并持久化到 Extra，返回设置的 mode 值。
+// EnsureOpenAIPrivacy 仅在账号显式开启 openai_auto_privacy_ensure 后自动设置隐私。
 func (s *adminServiceImpl) EnsureOpenAIPrivacy(ctx context.Context, account *Account) string {
 	if account.Platform != PlatformOpenAI || account.Type != AccountTypeOAuth {
 		return ""
 	}
 	if s.privacyClientFactory == nil {
+		return ""
+	}
+	if !shouldAutoEnsureOpenAIPrivacy(account.Extra) {
 		return ""
 	}
 	if shouldSkipOpenAIPrivacyEnsure(account.Extra) {
@@ -3856,11 +3860,9 @@ func (s *adminServiceImpl) EnsureOpenAIPrivacy(ctx context.Context, account *Acc
 		return ""
 	}
 
-	var proxyURL string
-	if account.ProxyID != nil {
-		if p, err := s.proxyRepo.GetByID(ctx, *account.ProxyID); err == nil && p != nil {
-			proxyURL = p.URL()
-		}
+	proxyURL, ok := resolveOpenAIPrivacyProxyURL(ctx, s.proxyRepo, account)
+	if !ok {
+		return ""
 	}
 
 	mode := disableOpenAITraining(ctx, s.privacyClientFactory, token, proxyURL)
@@ -3872,7 +3874,7 @@ func (s *adminServiceImpl) EnsureOpenAIPrivacy(ctx context.Context, account *Acc
 	return mode
 }
 
-// ForceOpenAIPrivacy 强制重新设置 OpenAI OAuth 账号隐私，无论当前状态。
+// ForceOpenAIPrivacy 手动强制重新设置 OpenAI OAuth 账号隐私；仅供显式用户操作调用。
 func (s *adminServiceImpl) ForceOpenAIPrivacy(ctx context.Context, account *Account) string {
 	if account.Platform != PlatformOpenAI || account.Type != AccountTypeOAuth {
 		return ""
@@ -3880,17 +3882,18 @@ func (s *adminServiceImpl) ForceOpenAIPrivacy(ctx context.Context, account *Acco
 	if s.privacyClientFactory == nil {
 		return ""
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	token, _ := account.Credentials["access_token"].(string)
 	if token == "" {
 		return ""
 	}
 
-	var proxyURL string
-	if account.ProxyID != nil {
-		if p, err := s.proxyRepo.GetByID(ctx, *account.ProxyID); err == nil && p != nil {
-			proxyURL = p.URL()
-		}
+	proxyURL, ok := resolveOpenAIPrivacyProxyURL(ctx, s.proxyRepo, account)
+	if !ok {
+		return ""
 	}
 
 	mode := disableOpenAITraining(ctx, s.privacyClientFactory, token, proxyURL)
@@ -3929,11 +3932,10 @@ func (s *adminServiceImpl) EnsureAntigravityPrivacy(ctx context.Context, account
 
 	projectID, _ := account.Credentials["project_id"].(string)
 
-	var proxyURL string
-	if account.ProxyID != nil {
-		if p, err := s.proxyRepo.GetByID(ctx, *account.ProxyID); err == nil && p != nil {
-			proxyURL = p.URL()
-		}
+	proxyURL, err := resolveAntigravityProxyURL(ctx, s.proxyRepo, account.ProxyID)
+	if err != nil {
+		slog.Warn("antigravity_privacy_proxy_unavailable", "account_id", account.ID, "error", err)
+		return ""
 	}
 
 	mode := setAntigravityPrivacy(ctx, token, projectID, proxyURL)
@@ -3962,11 +3964,10 @@ func (s *adminServiceImpl) ForceAntigravityPrivacy(ctx context.Context, account 
 
 	projectID, _ := account.Credentials["project_id"].(string)
 
-	var proxyURL string
-	if account.ProxyID != nil {
-		if p, err := s.proxyRepo.GetByID(ctx, *account.ProxyID); err == nil && p != nil {
-			proxyURL = p.URL()
-		}
+	proxyURL, err := resolveAntigravityProxyURL(ctx, s.proxyRepo, account.ProxyID)
+	if err != nil {
+		slog.Warn("antigravity_privacy_proxy_unavailable", "account_id", account.ID, "error", err)
+		return ""
 	}
 
 	mode := setAntigravityPrivacy(ctx, token, projectID, proxyURL)

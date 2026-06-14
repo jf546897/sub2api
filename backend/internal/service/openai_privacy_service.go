@@ -20,6 +20,9 @@ const (
 	PrivacyModeTrainingOff = "training_off"
 	PrivacyModeFailed      = "training_set_failed"
 	PrivacyModeCFBlocked   = "training_set_cf_blocked"
+
+	openAIExtraAutoPrivacyEnsureKey = "openai_auto_privacy_ensure"
+	openAIExtraRefreshOnCRSSyncKey  = "openai_refresh_on_crs_sync"
 )
 
 func shouldSkipOpenAIPrivacyEnsure(extra map[string]any) bool {
@@ -30,9 +33,62 @@ func shouldSkipOpenAIPrivacyEnsure(extra map[string]any) bool {
 	if !ok {
 		return false
 	}
-	mode, _ := raw.(string)
+	mode, ok := raw.(string)
+	if !ok {
+		return false
+	}
 	mode = strings.TrimSpace(mode)
+	if mode == "" {
+		return false
+	}
 	return mode != PrivacyModeFailed && mode != PrivacyModeCFBlocked
+}
+
+func shouldAutoEnsureOpenAIPrivacy(extra map[string]any) bool {
+	return openAIExtraBool(extra, openAIExtraAutoPrivacyEnsureKey)
+}
+
+func shouldRefreshOpenAIAfterCRSSync(extra map[string]any) bool {
+	return openAIExtraBool(extra, openAIExtraRefreshOnCRSSyncKey)
+}
+
+func openAIExtraBool(extra map[string]any, key string) bool {
+	if extra == nil {
+		return false
+	}
+	switch v := extra[key].(type) {
+	case bool:
+		return v
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			return true
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+}
+
+func resolveOpenAIPrivacyProxyURL(ctx context.Context, proxyRepo ProxyRepository, account *Account) (string, bool) {
+	if account == nil || account.ProxyID == nil {
+		return "", true
+	}
+	if proxyRepo == nil {
+		slog.Warn("openai_privacy_proxy_repo_missing", "account_id", account.ID, "proxy_id", *account.ProxyID)
+		return "", false
+	}
+	proxy, err := proxyRepo.GetByID(ctx, *account.ProxyID)
+	if err != nil {
+		slog.Warn("openai_privacy_proxy_lookup_failed", "account_id", account.ID, "proxy_id", *account.ProxyID, "error", err)
+		return "", false
+	}
+	if proxy == nil {
+		slog.Warn("openai_privacy_proxy_lookup_empty", "account_id", account.ID, "proxy_id", *account.ProxyID)
+		return "", false
+	}
+	return proxy.URL(), true
 }
 
 // disableOpenAITraining calls ChatGPT settings API to turn off "Improve the model for everyone".

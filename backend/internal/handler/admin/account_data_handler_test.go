@@ -254,7 +254,7 @@ func TestImportDataReusesProxyAndSkipsDefaultGroup(t *testing.T) {
 					"name":        "acc",
 					"platform":    service.PlatformOpenAI,
 					"type":        service.AccountTypeOAuth,
-					"credentials": map[string]any{"token": "x"},
+					"credentials": map[string]any{"access_token": "access-token", "refresh_token": "refresh-token"},
 					"proxy_key":   "socks5|1.2.3.4|1080|u|p",
 					"concurrency": 3,
 					"priority":    50,
@@ -274,4 +274,53 @@ func TestImportDataReusesProxyAndSkipsDefaultGroup(t *testing.T) {
 	require.Len(t, adminSvc.createdProxies, 0)
 	require.Len(t, adminSvc.createdAccounts, 1)
 	require.True(t, adminSvc.createdAccounts[0].SkipDefaultGroupBind)
+}
+
+func TestImportDataRejectsOpenAIOAuthWithoutUsableToken(t *testing.T) {
+	router, adminSvc := setupAccountDataRouter()
+
+	dataPayload := map[string]any{
+		"data": map[string]any{
+			"type":    dataType,
+			"version": dataVersion,
+			"proxies": []map[string]any{},
+			"accounts": []map[string]any{
+				{
+					"name":        "bad-openai",
+					"platform":    service.PlatformOpenAI,
+					"type":        service.AccountTypeOAuth,
+					"credentials": map[string]any{"refresh_token": "", "id_token": "header.payload.signature"},
+				},
+			},
+		},
+	}
+
+	body, _ := json.Marshal(dataPayload)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/accounts/data", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var resp struct {
+		Code int `json:"code"`
+		Data struct {
+			AccountCreated int `json:"account_created"`
+			AccountFailed  int `json:"account_failed"`
+			Errors         []struct {
+				Kind    string `json:"kind"`
+				Name    string `json:"name"`
+				Message string `json:"message"`
+			} `json:"errors"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Equal(t, 0, resp.Code)
+	require.Equal(t, 0, resp.Data.AccountCreated)
+	require.Equal(t, 1, resp.Data.AccountFailed)
+	require.Len(t, adminSvc.createdAccounts, 0)
+	require.Len(t, resp.Data.Errors, 1)
+	require.Equal(t, "account", resp.Data.Errors[0].Kind)
+	require.Equal(t, "bad-openai", resp.Data.Errors[0].Name)
+	require.Contains(t, resp.Data.Errors[0].Message, "refresh_token")
 }

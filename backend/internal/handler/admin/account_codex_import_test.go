@@ -142,7 +142,31 @@ func TestNormalizeCodexSessionJSONExtractsCredentialsAndIgnoresSessionToken(t *t
 	}
 }
 
-func TestMergeCodexImportCredentialsClearsStaleRefreshFieldsWhenIncomingHasNoRefreshToken(t *testing.T) {
+func TestNormalizeCodexImportEntryReadsNestedOAuthRefreshToken(t *testing.T) {
+	accessToken := buildCodexImportTestJWT(t, time.Now().Add(time.Hour), map[string]any{})
+	raw := map[string]any{
+		"accessToken": accessToken,
+		"oauth": map[string]any{
+			"refreshToken": "nested-refresh-token",
+		},
+	}
+
+	item, err := normalizeCodexImportEntry(codexImportEntry{Index: 1, Value: raw})
+	if err != nil {
+		t.Fatalf("normalizeCodexImportEntry error = %v", err)
+	}
+	if item.RefreshToken != "nested-refresh-token" {
+		t.Fatalf("RefreshToken = %q, want nested-refresh-token", item.RefreshToken)
+	}
+	if item.Credentials["refresh_token"] != "nested-refresh-token" {
+		t.Fatalf("credentials refresh_token = %v, want nested-refresh-token", item.Credentials["refresh_token"])
+	}
+	if _, ok := item.Credentials["_token_version"]; !ok {
+		t.Fatalf("_token_version should be set for imported access token")
+	}
+}
+
+func TestMergeCodexImportCredentialsClearsRefreshFieldsWhenIncomingHasNoRefreshToken(t *testing.T) {
 	existing := map[string]any{
 		"access_token":       "old-access-token",
 		"refresh_token":      "old-refresh-token",
@@ -170,10 +194,10 @@ func TestMergeCodexImportCredentialsClearsStaleRefreshFieldsWhenIncomingHasNoRef
 		t.Fatalf("chatgpt_account_id = %v, want acct-new", merged["chatgpt_account_id"])
 	}
 	if _, ok := merged["refresh_token"]; ok {
-		t.Fatalf("refresh_token should be cleared")
+		t.Fatalf("refresh_token should be cleared when incoming JSON has no refresh token")
 	}
 	if _, ok := merged["client_id"]; ok {
-		t.Fatalf("client_id should be cleared")
+		t.Fatalf("client_id should be cleared when incoming JSON has no refresh token")
 	}
 	if _, ok := merged["id_token"]; ok {
 		t.Fatalf("id_token should be cleared")

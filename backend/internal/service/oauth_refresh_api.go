@@ -197,12 +197,25 @@ func MergeCredentials(oldCreds, newCreds map[string]any) map[string]any {
 	if newCreds == nil {
 		newCreds = make(map[string]any)
 	}
+	if isEmptyCredentialValue(newCreds["refresh_token"]) {
+		delete(newCreds, "refresh_token")
+	}
 	for k, v := range oldCreds {
 		if _, exists := newCreds[k]; !exists {
 			newCreds[k] = v
 		}
 	}
 	return newCreds
+}
+
+func isEmptyCredentialValue(value any) bool {
+	if value == nil {
+		return true
+	}
+	if s, ok := value.(string); ok {
+		return strings.TrimSpace(s) == ""
+	}
+	return false
 }
 
 // BuildClaudeAccountCredentials 为 Claude 平台构建 OAuth credentials map

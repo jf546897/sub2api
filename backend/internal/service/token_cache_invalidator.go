@@ -52,6 +52,7 @@ func (c *CompositeTokenCacheInvalidator) InvalidateToken(ctx context.Context, ac
 
 	// 删除所有可能的缓存键（去重后）
 	seen := make(map[string]bool)
+	var firstErr error
 	for _, key := range keysToDelete {
 		if seen[key] {
 			continue
@@ -59,10 +60,13 @@ func (c *CompositeTokenCacheInvalidator) InvalidateToken(ctx context.Context, ac
 		seen[key] = true
 		if err := c.cache.DeleteAccessToken(ctx, key); err != nil {
 			slog.Warn("token_cache_delete_failed", "key", key, "account_id", account.ID, "error", err)
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 
-	return nil
+	return firstErr
 }
 
 // CheckTokenVersion 检查 account 的 token 版本是否已过时，并返回最新的 account

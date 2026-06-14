@@ -17,7 +17,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/repository"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 
-	_ "github.com/lib/pq"
+	pq "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 	"gopkg.in/yaml.v3"
 )
@@ -69,6 +69,27 @@ func GetConfigFilePath() string {
 // GetInstallLockPath returns the full path to .installed lock file
 func GetInstallLockPath() string {
 	return GetDataDir() + "/" + InstallLockFile
+}
+
+func ensureDataDir() error {
+	dataDir := strings.TrimSpace(GetDataDir())
+	if dataDir == "" {
+		return fmt.Errorf("data directory is empty")
+	}
+
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		return fmt.Errorf("create data directory %q: %w", dataDir, err)
+	}
+
+	info, err := os.Stat(dataDir)
+	if err != nil {
+		return fmt.Errorf("stat data directory %q: %w", dataDir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("data directory %q is not a directory", dataDir)
+	}
+
+	return nil
 }
 
 // SetupConfig holds the setup configuration
@@ -163,7 +184,12 @@ func NeedsSetup() bool {
 func buildPostgresDSN(cfg *DatabaseConfig, dbName string) string {
 	return fmt.Sprintf(
 		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		cfg.Host, cfg.Port, cfg.User, cfg.Password, dbName, cfg.SSLMode,
+		quotePostgresDSNValue(cfg.Host),
+		cfg.Port,
+		quotePostgresDSNValue(cfg.User),
+		quotePostgresDSNValue(cfg.Password),
+		quotePostgresDSNValue(dbName),
+		quotePostgresDSNValue(normalizeDatabaseSSLMode(cfg.SSLMode)),
 	)
 }
 
@@ -171,8 +197,53 @@ func buildDatabaseConnectionDSNs(cfg *DatabaseConfig) (bootstrapDSN, targetDSN s
 	return buildPostgresDSN(cfg, "postgres"), buildPostgresDSN(cfg, cfg.DBName)
 }
 
+func normalizeDatabaseSSLMode(mode string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		return "disable"
+	}
+	return mode
+}
+
+func quotePostgresDSNValue(value string) string {
+	if value == "" {
+		return value
+	}
+	if !strings.ContainsAny(value, " \t\r\n'\\") {
+		return value
+	}
+	escaped := strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(value)
+	return "'" + escaped + "'"
+}
+
+func validateDatabaseConfigForConnection(cfg *DatabaseConfig) error {
+	if cfg == nil {
+		return fmt.Errorf("database config is required")
+	}
+	if strings.TrimSpace(cfg.Host) == "" || strings.ContainsRune(cfg.Host, 0) {
+		return fmt.Errorf("invalid database host")
+	}
+	if !validatePort(cfg.Port) {
+		return fmt.Errorf("invalid database port")
+	}
+	if strings.TrimSpace(cfg.User) == "" || strings.ContainsRune(cfg.User, 0) {
+		return fmt.Errorf("invalid database user")
+	}
+	if strings.TrimSpace(cfg.DBName) == "" || strings.ContainsRune(cfg.DBName, 0) || len(cfg.DBName) > 63 {
+		return fmt.Errorf("invalid database name")
+	}
+	if !validateSSLMode(normalizeDatabaseSSLMode(cfg.SSLMode)) {
+		return fmt.Errorf("invalid database sslmode")
+	}
+	return nil
+}
+
 // TestDatabaseConnection tests the database connection and creates database if not exists
 func TestDatabaseConnection(cfg *DatabaseConfig) error {
+	if err := validateDatabaseConfigForConnection(cfg); err != nil {
+		return err
+	}
+
 	// First, connect to the default 'postgres' database to check/create target database.
 	// Connecting to cfg.DBName here fails when the target database has not been
 	// created yet, so the bootstrap connection must use PostgreSQL's maintenance DB.
@@ -208,10 +279,8 @@ func TestDatabaseConnection(cfg *DatabaseConfig) error {
 
 	// Create database if not exists
 	if !exists {
-		// 注意：数据库名不能参数化，依赖前置输入校验保障安全。
-		// Note: Database names cannot be parameterized, but we've already validated cfg.DBName
-		// in the handler using validateDBName() which only allows [a-zA-Z][a-zA-Z0-9_]*
-		_, err := db.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE %s", cfg.DBName))
+		// 数据库名不能参数化，必须作为 PostgreSQL 标识符安全引用。
+		_, err := db.ExecContext(ctx, "CREATE DATABASE "+pq.QuoteIdentifier(cfg.DBName))
 		if err != nil {
 			return fmt.Errorf("failed to create database '%s': %w", cfg.DBName, err)
 		}
@@ -284,6 +353,10 @@ func Install(cfg *SetupConfig) error {
 		return fmt.Errorf("system is already installed, re-installation is not allowed")
 	}
 
+	if err := ensureDataDir(); err != nil {
+		return err
+	}
+
 	// Generate JWT secret if not provided
 	if cfg.JWT.Secret == "" {
 		secret, err := generateSecret(32)
@@ -333,11 +406,7 @@ func createInstallLock() error {
 }
 
 func initializeDatabase(cfg *SetupConfig) error {
-	dsn := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		cfg.Database.Host, cfg.Database.Port, cfg.Database.User,
-		cfg.Database.Password, cfg.Database.DBName, cfg.Database.SSLMode,
-	)
+	dsn := buildPostgresDSN(&cfg.Database, cfg.Database.DBName)
 
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
@@ -356,11 +425,7 @@ func initializeDatabase(cfg *SetupConfig) error {
 }
 
 func createAdminUser(cfg *SetupConfig) (bool, string, error) {
-	dsn := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		cfg.Database.Host, cfg.Database.Port, cfg.Database.User,
-		cfg.Database.Password, cfg.Database.DBName, cfg.Database.SSLMode,
-	)
+	dsn := buildPostgresDSN(&cfg.Database, cfg.Database.DBName)
 
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
@@ -541,6 +606,10 @@ func getEnvIntOrDefault(key string, defaultValue int) int {
 func AutoSetupFromEnv() error {
 	logger.LegacyPrintf("setup", "%s", "Auto setup enabled, configuring from environment variables...")
 	logger.LegacyPrintf("setup", "Data directory: %s", GetDataDir())
+
+	if err := ensureDataDir(); err != nil {
+		return err
+	}
 
 	// Get timezone from TZ or TIMEZONE env var (TZ is standard for Docker)
 	tz := getEnvOrDefault("TZ", "")

@@ -132,6 +132,26 @@ func (s *HTTPUpstreamSuite) TestOpenAIProfileTLSFingerprintDoesNotInheritGeneric
 	require.Equal(s.T(), time.Duration(0), transport.ResponseHeaderTimeout, "OpenAI TLS path should not inherit generic header timeout")
 }
 
+func (s *HTTPUpstreamSuite) TestTLSFingerprintProfileChangeRebuildsClient() {
+	svc := s.newService()
+	profile1 := &tlsfingerprint.Profile{
+		Name:          "same display name",
+		ALPNProtocols: []string{"http/1.1"},
+	}
+	profile2 := &tlsfingerprint.Profile{
+		Name:          "same display name",
+		ALPNProtocols: []string{"h2"},
+	}
+
+	entry1, err := svc.getClientEntryWithTLS("", 1, 1, profile1, service.HTTPUpstreamProfileDefault, false, false)
+	require.NoError(s.T(), err)
+	entry2, err := svc.getClientEntryWithTLS("", 1, 1, profile2, service.HTTPUpstreamProfileDefault, false, false)
+	require.NoError(s.T(), err)
+
+	require.NotSame(s.T(), entry1, entry2, "different TLS profiles must not reuse the same upstream client")
+	require.Len(s.T(), svc.clients, 2)
+}
+
 func (s *HTTPUpstreamSuite) TestOpenAIProfileHTTP2DisabledUsesHTTP1Transport() {
 	s.cfg.Gateway = config.GatewayConfig{
 		OpenAIHTTP2: config.GatewayOpenAIHTTP2Config{Enabled: false},

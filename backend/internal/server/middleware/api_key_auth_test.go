@@ -12,6 +12,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
@@ -602,6 +603,108 @@ func TestAPIKeyAuthGoogleSetsOpsFallbackKeyOnEarlyAbort(t *testing.T) {
 	require.Equal(t, user.ID, fallback.User.ID)
 }
 
+func TestAPIKeyAuthGoogleUsesSharedAPIKeyRestrictions(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	user := &service.User{
+		ID:          9,
+		Role:        service.RoleUser,
+		Status:      service.StatusActive,
+		Balance:     10,
+		Concurrency: 3,
+	}
+
+	tests := []struct {
+		name       string
+		apiKey     *service.APIKey
+		configure  func(*http.Request, *config.Config)
+		wantStatus int
+		wantBody   string
+	}{
+		{
+			name: "ip acl denied",
+			apiKey: &service.APIKey{
+				ID:                  200,
+				UserID:              user.ID,
+				Key:                 "google-ip-key",
+				Status:              service.StatusActive,
+				User:                user,
+				IPWhitelist:         []string{"1.2.3.4"},
+				CompiledIPWhitelist: ip.CompileIPRules([]string{"1.2.3.4"}),
+			},
+			configure: func(req *http.Request, cfg *config.Config) {
+				req.RemoteAddr = "9.9.9.9:12345"
+				req.Header.Set("X-Forwarded-For", "1.2.3.4")
+				req.Header.Set("X-Real-IP", "1.2.3.4")
+				req.Header.Set("CF-Connecting-IP", "1.2.3.4")
+			},
+			wantStatus: http.StatusForbidden,
+			wantBody:   "Access denied",
+		},
+		{
+			name: "expired key denied",
+			apiKey: &service.APIKey{
+				ID:        201,
+				UserID:    user.ID,
+				Key:       "google-expired-key",
+				Status:    service.StatusActive,
+				User:      user,
+				ExpiresAt: ptrTime(time.Now().Add(-time.Hour)),
+			},
+			wantStatus: http.StatusForbidden,
+			wantBody:   "API key 已过期",
+		},
+		{
+			name: "quota exhausted key denied",
+			apiKey: &service.APIKey{
+				ID:        202,
+				UserID:    user.ID,
+				Key:       "google-quota-key",
+				Status:    service.StatusActive,
+				User:      user,
+				Quota:     1,
+				QuotaUsed: 1,
+			},
+			wantStatus: http.StatusTooManyRequests,
+			wantBody:   "API key 额度已用完",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apiKeyRepo := &stubApiKeyRepo{
+				getByKey: func(ctx context.Context, key string) (*service.APIKey, error) {
+					if key != tt.apiKey.Key {
+						return nil, service.ErrAPIKeyNotFound
+					}
+					clone := *tt.apiKey
+					return &clone, nil
+				},
+			}
+			cfg := &config.Config{RunMode: config.RunModeStandard}
+			apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+			router := gin.New()
+			require.NoError(t, router.SetTrustedProxies(nil))
+			router.Use(gin.HandlerFunc(APIKeyAuthWithSubscriptionGoogle(apiKeyService, nil, cfg)))
+			router.GET("/v1beta/models", func(c *gin.Context) {
+				c.JSON(http.StatusOK, gin.H{"ok": true})
+			})
+
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/v1beta/models", nil)
+			req.Header.Set("x-goog-api-key", tt.apiKey.Key)
+			if tt.configure != nil {
+				tt.configure(req, cfg)
+			}
+			router.ServeHTTP(w, req)
+
+			require.Equal(t, tt.wantStatus, w.Code)
+			require.Contains(t, w.Body.String(), tt.wantBody)
+			require.Contains(t, w.Body.String(), `"error"`)
+		})
+	}
+}
+
 func TestRequireGroupAssignmentMarksUngroupedKeyBusinessLimited(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -897,6 +1000,10 @@ func TestAPIKeyAuthTouchesLastUsedInStandardMode(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, w.Code)
 	require.Equal(t, 1, touchCalls)
+}
+
+func ptrTime(v time.Time) *time.Time {
+	return &v
 }
 
 func newAuthTestRouter(apiKeyService *service.APIKeyService, subscriptionService *service.SubscriptionService, cfg *config.Config) *gin.Engine {

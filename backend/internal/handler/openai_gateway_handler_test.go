@@ -559,6 +559,34 @@ func TestOpenAIResponses_RejectsMessageIDAsPreviousResponseID(t *testing.T) {
 	require.Contains(t, w.Body.String(), "previous_response_id must be a response.id")
 }
 
+func TestOpenAIResponses_RejectsUnknownPreviousResponseID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", strings.NewReader(
+		`{"model":"gpt-5.1","stream":false,"previous_response_id":"foo_123456","input":[{"type":"function_call_output","call_id":"call_1","output":"{}"}]}`,
+	))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	groupID := int64(2)
+	c.Set(string(middleware.ContextKeyAPIKey), &service.APIKey{
+		ID:      101,
+		GroupID: &groupID,
+		User:    &service.User{ID: 1},
+	})
+	c.Set(string(middleware.ContextKeyUser), middleware.AuthSubject{
+		UserID:      1,
+		Concurrency: 1,
+	})
+
+	h := newOpenAIHandlerForPreviousResponseIDValidation(t, nil)
+	h.Responses(c)
+
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Contains(t, w.Body.String(), "previous_response_id must be a response.id")
+}
+
 func TestOpenAIResponses_RejectsHTTPContinuationPreviousResponseID(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -586,6 +614,23 @@ func TestOpenAIResponses_RejectsHTTPContinuationPreviousResponseID(t *testing.T)
 	require.Equal(t, http.StatusBadRequest, w.Code)
 	require.Contains(t, w.Body.String(), "Responses WebSocket v2")
 	require.Contains(t, w.Body.String(), "previous_response_id")
+}
+
+func TestOpenAIResponses_HTTPPreviousResponseIDAllowedForToolOutput(t *testing.T) {
+	toolOutputBody := []byte(`{"model":"gpt-5.1","stream":false,"previous_response_id":"resp_123456","input":[{"type":"function_call_output","call_id":"call_1","output":"{}"}]}`)
+	require.True(t, openAIHTTPPreviousResponseIDAllowed(toolOutputBody))
+
+	searchOutputBody := []byte(`{"model":"gpt-5.1","stream":false,"previous_response_id":"resp_123456","input":[{"type":"tool_search_output","call_id":"call_1","output":"{}"}]}`)
+	require.True(t, openAIHTTPPreviousResponseIDAllowed(searchOutputBody))
+
+	missingCallIDBody := []byte(`{"model":"gpt-5.1","stream":false,"previous_response_id":"resp_123456","input":[{"type":"function_call_output","output":"{}"}]}`)
+	require.False(t, openAIHTTPPreviousResponseIDAllowed(missingCallIDBody))
+
+	missingSearchCallIDBody := []byte(`{"model":"gpt-5.1","stream":false,"previous_response_id":"resp_123456","input":[{"type":"function_call_output","call_id":"call_1","output":"{}"},{"type":"function_call","call_id":"call_1"},{"type":"tool_search_output","output":"{}"}]}`)
+	require.False(t, openAIHTTPPreviousResponseIDAllowed(missingSearchCallIDBody))
+
+	plainBody := []byte(`{"model":"gpt-5.1","stream":false,"previous_response_id":"resp_123456","input":[{"type":"input_text","text":"hello"}]}`)
+	require.False(t, openAIHTTPPreviousResponseIDAllowed(plainBody))
 }
 
 func TestOpenAIResponses_FunctionCallOutputHTTPGuidanceDoesNotSuggestPreviousResponseReuse(t *testing.T) {
@@ -677,6 +722,39 @@ func TestOpenAIResponsesWebSocket_RejectsMessageIDAsPreviousResponseID(t *testin
 	require.ErrorAs(t, err, &closeErr)
 	require.Equal(t, coderws.StatusPolicyViolation, closeErr.Code)
 	require.Contains(t, strings.ToLower(closeErr.Reason), "previous_response_id")
+}
+
+func TestOpenAIResponsesWebSocket_RejectsUnknownPreviousResponseID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	h := newOpenAIHandlerForPreviousResponseIDValidation(t, nil)
+	wsServer := newOpenAIWSHandlerTestServer(t, h, middleware.AuthSubject{UserID: 1, Concurrency: 1})
+	defer wsServer.Close()
+
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), 3*time.Second)
+	clientConn, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(wsServer.URL, "http")+"/openai/v1/responses", nil)
+	cancelDial()
+	require.NoError(t, err)
+	defer func() {
+		_ = clientConn.CloseNow()
+	}()
+
+	writeCtx, cancelWrite := context.WithTimeout(context.Background(), 3*time.Second)
+	err = clientConn.Write(writeCtx, coderws.MessageText, []byte(
+		`{"type":"response.create","model":"gpt-5.1","stream":false,"previous_response_id":"foo_abc123"}`,
+	))
+	cancelWrite()
+	require.NoError(t, err)
+
+	readCtx, cancelRead := context.WithTimeout(context.Background(), 3*time.Second)
+	_, _, err = clientConn.Read(readCtx)
+	cancelRead()
+	require.Error(t, err)
+	var closeErr coderws.CloseError
+	require.ErrorAs(t, err, &closeErr)
+	require.Equal(t, coderws.StatusPolicyViolation, closeErr.Code)
+	require.Contains(t, strings.ToLower(closeErr.Reason), "previous_response_id")
+	require.Contains(t, strings.ToLower(closeErr.Reason), "response.id")
 }
 
 func TestOpenAIResponsesWebSocket_PreviousResponseIDKindLoggedBeforeAcquireFailure(t *testing.T) {

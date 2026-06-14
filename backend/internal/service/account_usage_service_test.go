@@ -157,6 +157,49 @@ func TestAccountUsageService_GetOpenAIUsage_DoesNotPromoteCodexExtraToRateLimit(
 	}
 }
 
+func TestAccountUsageService_OpenAICodexProbeAccessTokenUsesCurrentLegacyToken(t *testing.T) {
+	t.Parallel()
+
+	expiresAt := time.Now().Add(time.Hour)
+	account := &Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token": " access_current ",
+			"expires_at":   expiresAt.Format(time.RFC3339),
+		},
+	}
+	token, err := (&AccountUsageService{}).openAICodexProbeAccessToken(context.Background(), account)
+	if err != nil {
+		t.Fatalf("openAICodexProbeAccessToken() error = %v", err)
+	}
+	if token != "access_current" {
+		t.Fatalf("token = %q, want access_current", token)
+	}
+}
+
+func TestAccountUsageService_OpenAICodexProbeAccessTokenBlocksExpiredRefreshableTokenWithoutProvider(t *testing.T) {
+	t.Parallel()
+
+	expiresAt := time.Now().Add(-time.Minute)
+	account := &Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token":  "expired_access",
+			"refresh_token": "refresh_present",
+			"expires_at":    expiresAt.Format(time.RFC3339),
+		},
+	}
+	token, err := (&AccountUsageService{}).openAICodexProbeAccessToken(context.Background(), account)
+	if err == nil {
+		t.Fatal("expected expired refreshable token to require provider refresh")
+	}
+	if token != "" {
+		t.Fatalf("token = %q, want empty", token)
+	}
+}
+
 func TestBuildCodexUsageProgressFromExtra_ZerosExpiredWindow(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 3, 16, 12, 0, 0, 0, time.UTC)

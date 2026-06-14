@@ -1,7 +1,7 @@
 -- Ops Monitoring (vNext): squashed migration (030)
 --
 -- This repository originally planned Ops vNext as migrations 030-036:
---   030 drop legacy ops tables
+--   030 preserve legacy ops tables
 --   031 core schema
 --   032 pre-aggregation tables
 --   033 indexes + optional extensions
@@ -9,39 +9,24 @@
 --   035 add notify_email to alert rules
 --   036 seed default alert rules
 --
--- Since these migrations have NOT been applied to any environment yet, we squash them
--- into a single 030 migration for easier review and a cleaner migration history.
+-- Keep this squashed migration conservative because private/test deployments may
+-- already have legacy ops_* data. The CREATE/ALTER/INSERT statements below are
+-- written to add missing schema without deleting existing objects.
 --
 -- Notes:
--- - This is intentionally destructive for ops_* data (error logs / metrics / alerts).
--- - It is idempotent (DROP/CREATE/ALTER IF EXISTS/IF NOT EXISTS), but will wipe ops_* data if re-run.
+-- - Existing ops_* data and objects must be preserved.
+-- - It is idempotent (CREATE/ALTER IF EXISTS/IF NOT EXISTS and ON CONFLICT inserts).
 
 -- =====================================================================
--- 030_ops_drop_legacy_ops_tables.sql
+-- 030_ops_preserve_legacy_ops_tables.sql
 -- =====================================================================
 
 SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '10min';
 
--- Legacy pre-aggregation tables (from 026 and/or previous branches)
-DROP TABLE IF EXISTS ops_metrics_daily CASCADE;
-DROP TABLE IF EXISTS ops_metrics_hourly CASCADE;
-
--- Core ops tables that may exist in some deployments / branches
-DROP TABLE IF EXISTS ops_system_metrics CASCADE;
-DROP TABLE IF EXISTS ops_error_logs CASCADE;
-DROP TABLE IF EXISTS ops_alert_events CASCADE;
-DROP TABLE IF EXISTS ops_alert_rules CASCADE;
-DROP TABLE IF EXISTS ops_job_heartbeats CASCADE;
-DROP TABLE IF EXISTS ops_retry_attempts CASCADE;
-
--- Optional legacy tables (best-effort cleanup)
-DROP TABLE IF EXISTS ops_scheduled_reports CASCADE;
-DROP TABLE IF EXISTS ops_group_availability_configs CASCADE;
-DROP TABLE IF EXISTS ops_group_availability_events CASCADE;
-
--- Optional legacy views/indexes
-DROP VIEW IF EXISTS ops_latest_metrics CASCADE;
+-- Legacy ops tables/views are intentionally preserved; destructive removal
+-- statements are not allowed here. Later sections use CREATE TABLE IF NOT EXISTS
+-- and ALTER TABLE ... ADD COLUMN IF NOT EXISTS to fill gaps safely.
 
 -- =====================================================================
 -- 031_ops_core_schema.sql
@@ -135,6 +120,53 @@ CREATE TABLE IF NOT EXISTS ops_error_logs (
 
 COMMENT ON TABLE ops_error_logs IS 'Ops error logs (vNext). Stores sanitized error details and request_body for retries (errors only).';
 
+-- Legacy compatibility: CREATE TABLE IF NOT EXISTS does not add columns to
+-- already-existing tables. Fill the vNext shape before indexes or writes use it.
+ALTER TABLE ops_error_logs
+    ADD COLUMN IF NOT EXISTS id BIGSERIAL,
+    ADD COLUMN IF NOT EXISTS request_id VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS client_request_id VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS user_id BIGINT,
+    ADD COLUMN IF NOT EXISTS api_key_id BIGINT,
+    ADD COLUMN IF NOT EXISTS account_id BIGINT,
+    ADD COLUMN IF NOT EXISTS group_id BIGINT,
+    ADD COLUMN IF NOT EXISTS client_ip inet,
+    ADD COLUMN IF NOT EXISTS platform VARCHAR(32),
+    ADD COLUMN IF NOT EXISTS model VARCHAR(100),
+    ADD COLUMN IF NOT EXISTS request_path VARCHAR(256),
+    ADD COLUMN IF NOT EXISTS stream BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS user_agent TEXT,
+    ADD COLUMN IF NOT EXISTS error_phase VARCHAR(32) NOT NULL DEFAULT 'unknown',
+    ADD COLUMN IF NOT EXISTS error_type VARCHAR(64) NOT NULL DEFAULT 'unknown',
+    ADD COLUMN IF NOT EXISTS severity VARCHAR(8) NOT NULL DEFAULT 'P2',
+    ADD COLUMN IF NOT EXISTS status_code INT,
+    ADD COLUMN IF NOT EXISTS is_business_limited BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS error_message TEXT,
+    ADD COLUMN IF NOT EXISTS error_body TEXT,
+    ADD COLUMN IF NOT EXISTS error_source VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS error_owner VARCHAR(32),
+    ADD COLUMN IF NOT EXISTS account_status VARCHAR(50),
+    ADD COLUMN IF NOT EXISTS upstream_status_code INT,
+    ADD COLUMN IF NOT EXISTS upstream_error_message TEXT,
+    ADD COLUMN IF NOT EXISTS upstream_error_detail TEXT,
+    ADD COLUMN IF NOT EXISTS provider_error_code VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS provider_error_type VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS network_error_type VARCHAR(50),
+    ADD COLUMN IF NOT EXISTS retry_after_seconds INT,
+    ADD COLUMN IF NOT EXISTS duration_ms INT,
+    ADD COLUMN IF NOT EXISTS time_to_first_token_ms BIGINT,
+    ADD COLUMN IF NOT EXISTS auth_latency_ms BIGINT,
+    ADD COLUMN IF NOT EXISTS routing_latency_ms BIGINT,
+    ADD COLUMN IF NOT EXISTS upstream_latency_ms BIGINT,
+    ADD COLUMN IF NOT EXISTS response_latency_ms BIGINT,
+    ADD COLUMN IF NOT EXISTS request_body JSONB,
+    ADD COLUMN IF NOT EXISTS request_headers JSONB,
+    ADD COLUMN IF NOT EXISTS request_body_truncated BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS request_body_bytes INT,
+    ADD COLUMN IF NOT EXISTS is_retryable BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS retry_count INT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
 -- ============================================
 -- 2) ops_retry_attempts: audit log for retries
 -- ============================================
@@ -166,6 +198,22 @@ CREATE TABLE IF NOT EXISTS ops_retry_attempts (
 );
 
 COMMENT ON TABLE ops_retry_attempts IS 'Audit table for ops retries (client retry / pinned upstream retry).';
+
+ALTER TABLE ops_retry_attempts
+    ADD COLUMN IF NOT EXISTS id BIGSERIAL,
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS requested_by_user_id BIGINT,
+    ADD COLUMN IF NOT EXISTS source_error_id BIGINT,
+    ADD COLUMN IF NOT EXISTS mode VARCHAR(16) NOT NULL DEFAULT 'client',
+    ADD COLUMN IF NOT EXISTS pinned_account_id BIGINT,
+    ADD COLUMN IF NOT EXISTS status VARCHAR(16) NOT NULL DEFAULT 'queued',
+    ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS duration_ms BIGINT,
+    ADD COLUMN IF NOT EXISTS result_request_id VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS result_error_id BIGINT,
+    ADD COLUMN IF NOT EXISTS result_usage_request_id VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS error_message TEXT;
 
 -- ============================================
 -- 3) ops_system_metrics: system + request window snapshots
@@ -235,6 +283,46 @@ CREATE TABLE IF NOT EXISTS ops_system_metrics (
 
 COMMENT ON TABLE ops_system_metrics IS 'Ops system/request metrics snapshots (vNext). Used for dashboard overview and realtime rates.';
 
+ALTER TABLE ops_system_metrics
+    ADD COLUMN IF NOT EXISTS id BIGSERIAL,
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS window_minutes INT NOT NULL DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS platform VARCHAR(32),
+    ADD COLUMN IF NOT EXISTS group_id BIGINT,
+    ADD COLUMN IF NOT EXISTS success_count BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS error_count_total BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS business_limited_count BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS error_count_sla BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS upstream_error_count_excl_429_529 BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS upstream_429_count BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS upstream_529_count BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS token_consumed BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS qps DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS tps DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS duration_p50_ms INT,
+    ADD COLUMN IF NOT EXISTS duration_p90_ms INT,
+    ADD COLUMN IF NOT EXISTS duration_p95_ms INT,
+    ADD COLUMN IF NOT EXISTS duration_p99_ms INT,
+    ADD COLUMN IF NOT EXISTS duration_avg_ms DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS duration_max_ms INT,
+    ADD COLUMN IF NOT EXISTS ttft_p50_ms INT,
+    ADD COLUMN IF NOT EXISTS ttft_p90_ms INT,
+    ADD COLUMN IF NOT EXISTS ttft_p95_ms INT,
+    ADD COLUMN IF NOT EXISTS ttft_p99_ms INT,
+    ADD COLUMN IF NOT EXISTS ttft_avg_ms DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS ttft_max_ms INT,
+    ADD COLUMN IF NOT EXISTS cpu_usage_percent DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS memory_used_mb BIGINT,
+    ADD COLUMN IF NOT EXISTS memory_total_mb BIGINT,
+    ADD COLUMN IF NOT EXISTS memory_usage_percent DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS db_ok BOOLEAN,
+    ADD COLUMN IF NOT EXISTS redis_ok BOOLEAN,
+    ADD COLUMN IF NOT EXISTS db_conn_active INT,
+    ADD COLUMN IF NOT EXISTS db_conn_idle INT,
+    ADD COLUMN IF NOT EXISTS db_conn_waiting INT,
+    ADD COLUMN IF NOT EXISTS goroutine_count INT,
+    ADD COLUMN IF NOT EXISTS concurrency_queue_depth INT;
+
 -- ============================================
 -- 4) ops_job_heartbeats: background jobs health
 -- ============================================
@@ -252,6 +340,41 @@ CREATE TABLE IF NOT EXISTS ops_job_heartbeats (
 );
 
 COMMENT ON TABLE ops_job_heartbeats IS 'Ops background jobs heartbeats (vNext).';
+
+ALTER TABLE ops_job_heartbeats
+    ADD COLUMN IF NOT EXISTS job_name VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS last_run_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS last_success_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS last_error_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS last_error TEXT,
+    ADD COLUMN IF NOT EXISTS last_duration_ms BIGINT,
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+-- Legacy deployments may already contain duplicate rows. Abort with details
+-- instead of deleting data before adding the vNext uniqueness guarantee.
+DO $$
+DECLARE
+    duplicate_keys TEXT;
+BEGIN
+    SELECT string_agg(job_name || ' (count=' || duplicate_count::TEXT || ')', ', ')
+      INTO duplicate_keys
+      FROM (
+        SELECT job_name, COUNT(*) AS duplicate_count
+          FROM ops_job_heartbeats
+         WHERE job_name IS NOT NULL
+         GROUP BY job_name
+        HAVING COUNT(*) > 1
+         ORDER BY COUNT(*) DESC, job_name
+         LIMIT 10
+      ) d;
+
+    IF duplicate_keys IS NOT NULL THEN
+        RAISE EXCEPTION 'ops_job_heartbeats has duplicate job_name values: %. Resolve duplicates before applying 033_ops_monitoring_vnext.sql.', duplicate_keys;
+    END IF;
+END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ops_job_heartbeats_job_name_unique
+    ON ops_job_heartbeats (job_name);
 
 -- ============================================
 -- 5) ops_alert_rules / ops_alert_events
@@ -284,6 +407,44 @@ CREATE TABLE IF NOT EXISTS ops_alert_rules (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE ops_alert_rules
+    ADD COLUMN IF NOT EXISTS id BIGSERIAL,
+    ADD COLUMN IF NOT EXISTS name VARCHAR(128),
+    ADD COLUMN IF NOT EXISTS description TEXT,
+    ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT true,
+    ADD COLUMN IF NOT EXISTS severity VARCHAR(16) NOT NULL DEFAULT 'warning',
+    ADD COLUMN IF NOT EXISTS metric_type VARCHAR(64) NOT NULL DEFAULT 'unknown',
+    ADD COLUMN IF NOT EXISTS operator VARCHAR(8) NOT NULL DEFAULT '>',
+    ADD COLUMN IF NOT EXISTS threshold DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS window_minutes INT NOT NULL DEFAULT 5,
+    ADD COLUMN IF NOT EXISTS sustained_minutes INT NOT NULL DEFAULT 5,
+    ADD COLUMN IF NOT EXISTS cooldown_minutes INT NOT NULL DEFAULT 10,
+    ADD COLUMN IF NOT EXISTS filters JSONB,
+    ADD COLUMN IF NOT EXISTS last_triggered_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+DO $$
+DECLARE
+    duplicate_keys TEXT;
+BEGIN
+    SELECT string_agg(name || ' (count=' || duplicate_count::TEXT || ')', ', ')
+      INTO duplicate_keys
+      FROM (
+        SELECT name, COUNT(*) AS duplicate_count
+          FROM ops_alert_rules
+         WHERE name IS NOT NULL
+         GROUP BY name
+        HAVING COUNT(*) > 1
+         ORDER BY COUNT(*) DESC, name
+         LIMIT 10
+      ) d;
+
+    IF duplicate_keys IS NOT NULL THEN
+        RAISE EXCEPTION 'ops_alert_rules has duplicate name values: %. Resolve duplicates before applying 033_ops_monitoring_vnext.sql.', duplicate_keys;
+    END IF;
+END $$;
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ops_alert_rules_name_unique
     ON ops_alert_rules (name);
 
@@ -310,6 +471,21 @@ CREATE TABLE IF NOT EXISTS ops_alert_events (
     email_sent BOOLEAN NOT NULL DEFAULT false,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE ops_alert_events
+    ADD COLUMN IF NOT EXISTS id BIGSERIAL,
+    ADD COLUMN IF NOT EXISTS rule_id BIGINT,
+    ADD COLUMN IF NOT EXISTS severity VARCHAR(16) NOT NULL DEFAULT 'warning',
+    ADD COLUMN IF NOT EXISTS status VARCHAR(16) NOT NULL DEFAULT 'firing',
+    ADD COLUMN IF NOT EXISTS title VARCHAR(200),
+    ADD COLUMN IF NOT EXISTS description TEXT,
+    ADD COLUMN IF NOT EXISTS metric_value DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS threshold_value DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS dimensions JSONB,
+    ADD COLUMN IF NOT EXISTS fired_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS email_sent BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
 CREATE INDEX IF NOT EXISTS idx_ops_alert_events_rule_status
     ON ops_alert_events (rule_id, status);
@@ -375,6 +551,76 @@ CREATE TABLE IF NOT EXISTS ops_metrics_hourly (
 
 -- Uniqueness across three “dimension modes” (overall / platform / group).
 -- Postgres UNIQUE treats NULLs as distinct, so we enforce uniqueness via COALESCE.
+DO $$
+DECLARE
+    pk_name name;
+    pk_cols text[];
+BEGIN
+    SELECT c.conname, array_agg(a.attname ORDER BY x.ordinality)
+      INTO pk_name, pk_cols
+      FROM pg_constraint c
+      JOIN unnest(c.conkey) WITH ORDINALITY AS x(attnum, ordinality) ON true
+      JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = x.attnum
+     WHERE c.conrelid = 'ops_metrics_hourly'::regclass
+       AND c.contype = 'p'
+     GROUP BY c.conname;
+
+    IF pk_name IS NOT NULL AND pk_cols = ARRAY['bucket_start', 'platform']::text[] THEN
+        EXECUTE format('ALTER TABLE ops_metrics_hourly DROP CONSTRAINT %I', pk_name);
+    END IF;
+END $$;
+
+ALTER TABLE ops_metrics_hourly
+    ADD COLUMN IF NOT EXISTS id BIGSERIAL,
+    ADD COLUMN IF NOT EXISTS bucket_start TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS platform VARCHAR(32),
+    ADD COLUMN IF NOT EXISTS group_id BIGINT,
+    ADD COLUMN IF NOT EXISTS success_count BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS error_count_total BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS business_limited_count BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS error_count_sla BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS upstream_error_count_excl_429_529 BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS upstream_429_count BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS upstream_529_count BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS token_consumed BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS duration_p50_ms INT,
+    ADD COLUMN IF NOT EXISTS duration_p90_ms INT,
+    ADD COLUMN IF NOT EXISTS duration_p95_ms INT,
+    ADD COLUMN IF NOT EXISTS duration_p99_ms INT,
+    ADD COLUMN IF NOT EXISTS ttft_p50_ms INT,
+    ADD COLUMN IF NOT EXISTS ttft_p90_ms INT,
+    ADD COLUMN IF NOT EXISTS ttft_p95_ms INT,
+    ADD COLUMN IF NOT EXISTS ttft_p99_ms INT,
+    ADD COLUMN IF NOT EXISTS computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+ALTER TABLE ops_metrics_hourly
+    ALTER COLUMN platform DROP NOT NULL;
+
+DO $$
+DECLARE
+    duplicate_keys TEXT;
+BEGIN
+    SELECT string_agg(bucket_start::TEXT || '|platform=' || platform_key || '|group=' || group_key::TEXT || ' (count=' || duplicate_count::TEXT || ')', ', ')
+      INTO duplicate_keys
+      FROM (
+        SELECT
+            bucket_start,
+            COALESCE(platform, '') AS platform_key,
+            COALESCE(group_id, 0) AS group_key,
+            COUNT(*) AS duplicate_count
+          FROM ops_metrics_hourly
+         GROUP BY bucket_start, COALESCE(platform, ''), COALESCE(group_id, 0)
+        HAVING COUNT(*) > 1
+         ORDER BY COUNT(*) DESC, bucket_start DESC
+         LIMIT 10
+      ) d;
+
+    IF duplicate_keys IS NOT NULL THEN
+        RAISE EXCEPTION 'ops_metrics_hourly has duplicate bucket/platform/group rows: %. Resolve duplicates before applying 033_ops_monitoring_vnext.sql.', duplicate_keys;
+    END IF;
+END $$;
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ops_metrics_hourly_unique_dim
     ON ops_metrics_hourly (
         bucket_start,
@@ -431,6 +677,76 @@ CREATE TABLE IF NOT EXISTS ops_metrics_daily (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+DO $$
+DECLARE
+    pk_name name;
+    pk_cols text[];
+BEGIN
+    SELECT c.conname, array_agg(a.attname ORDER BY x.ordinality)
+      INTO pk_name, pk_cols
+      FROM pg_constraint c
+      JOIN unnest(c.conkey) WITH ORDINALITY AS x(attnum, ordinality) ON true
+      JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = x.attnum
+     WHERE c.conrelid = 'ops_metrics_daily'::regclass
+       AND c.contype = 'p'
+     GROUP BY c.conname;
+
+    IF pk_name IS NOT NULL AND pk_cols = ARRAY['bucket_date', 'platform']::text[] THEN
+        EXECUTE format('ALTER TABLE ops_metrics_daily DROP CONSTRAINT %I', pk_name);
+    END IF;
+END $$;
+
+ALTER TABLE ops_metrics_daily
+    ADD COLUMN IF NOT EXISTS id BIGSERIAL,
+    ADD COLUMN IF NOT EXISTS bucket_date DATE NOT NULL DEFAULT CURRENT_DATE,
+    ADD COLUMN IF NOT EXISTS platform VARCHAR(32),
+    ADD COLUMN IF NOT EXISTS group_id BIGINT,
+    ADD COLUMN IF NOT EXISTS success_count BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS error_count_total BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS business_limited_count BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS error_count_sla BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS upstream_error_count_excl_429_529 BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS upstream_429_count BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS upstream_529_count BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS token_consumed BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS duration_p50_ms INT,
+    ADD COLUMN IF NOT EXISTS duration_p90_ms INT,
+    ADD COLUMN IF NOT EXISTS duration_p95_ms INT,
+    ADD COLUMN IF NOT EXISTS duration_p99_ms INT,
+    ADD COLUMN IF NOT EXISTS ttft_p50_ms INT,
+    ADD COLUMN IF NOT EXISTS ttft_p90_ms INT,
+    ADD COLUMN IF NOT EXISTS ttft_p95_ms INT,
+    ADD COLUMN IF NOT EXISTS ttft_p99_ms INT,
+    ADD COLUMN IF NOT EXISTS computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+ALTER TABLE ops_metrics_daily
+    ALTER COLUMN platform DROP NOT NULL;
+
+DO $$
+DECLARE
+    duplicate_keys TEXT;
+BEGIN
+    SELECT string_agg(bucket_date::TEXT || '|platform=' || platform_key || '|group=' || group_key::TEXT || ' (count=' || duplicate_count::TEXT || ')', ', ')
+      INTO duplicate_keys
+      FROM (
+        SELECT
+            bucket_date,
+            COALESCE(platform, '') AS platform_key,
+            COALESCE(group_id, 0) AS group_key,
+            COUNT(*) AS duplicate_count
+          FROM ops_metrics_daily
+         GROUP BY bucket_date, COALESCE(platform, ''), COALESCE(group_id, 0)
+        HAVING COUNT(*) > 1
+         ORDER BY COUNT(*) DESC, bucket_date DESC
+         LIMIT 10
+      ) d;
+
+    IF duplicate_keys IS NOT NULL THEN
+        RAISE EXCEPTION 'ops_metrics_daily has duplicate bucket/platform/group rows: %. Resolve duplicates before applying 033_ops_monitoring_vnext.sql.', duplicate_keys;
+    END IF;
+END $$;
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ops_metrics_daily_unique_dim
     ON ops_metrics_daily (
         bucket_date,
@@ -450,6 +766,96 @@ CREATE INDEX IF NOT EXISTS idx_ops_metrics_daily_group_bucket
     WHERE group_id IS NOT NULL AND group_id <> 0;
 
 COMMENT ON TABLE ops_metrics_daily IS 'vNext daily pre-aggregated ops metrics (overall/platform/group).';
+
+-- Legacy compatibility: ALTER TABLE ... ADD COLUMN id BIGSERIAL creates the
+-- id column and sequence/default, but it does not add a PRIMARY KEY to tables
+-- that already existed before this squashed migration. Ensure every vNext
+-- id-based ops table has a usable id primary key.
+DO $$
+DECLARE
+    tbl_name text;
+    relid regclass;
+    has_id boolean;
+    has_pk boolean;
+    seq_name text;
+BEGIN
+    FOREACH tbl_name IN ARRAY ARRAY[
+        'ops_error_logs',
+        'ops_retry_attempts',
+        'ops_system_metrics',
+        'ops_alert_rules',
+        'ops_alert_events',
+        'ops_metrics_hourly',
+        'ops_metrics_daily'
+    ]
+    LOOP
+        relid := to_regclass(tbl_name);
+        IF relid IS NULL THEN
+            CONTINUE;
+        END IF;
+
+        SELECT EXISTS (
+            SELECT 1
+              FROM pg_attribute
+             WHERE attrelid = relid
+               AND attname = 'id'
+               AND NOT attisdropped
+        ) INTO has_id;
+
+        IF NOT has_id THEN
+            CONTINUE;
+        END IF;
+
+        SELECT pg_get_serial_sequence(tbl_name, 'id') INTO seq_name;
+        IF seq_name IS NULL THEN
+            seq_name := tbl_name || '_id_seq';
+            EXECUTE format('CREATE SEQUENCE IF NOT EXISTS %I', seq_name);
+            EXECUTE format('ALTER SEQUENCE %I OWNED BY %I.id', seq_name, tbl_name);
+            EXECUTE format('ALTER TABLE %I ALTER COLUMN id SET DEFAULT nextval(%L::regclass)', tbl_name, seq_name);
+        END IF;
+
+        EXECUTE format(
+            'SELECT setval(%L::regclass, COALESCE((SELECT MAX(id) FROM %I), 0) + 1, false)',
+            seq_name,
+            tbl_name
+        );
+        EXECUTE format('UPDATE %I SET id = nextval(%L::regclass) WHERE id IS NULL', tbl_name, seq_name);
+        EXECUTE format(
+            $sql$
+            WITH ranked AS (
+                SELECT ctid, row_number() OVER (PARTITION BY id ORDER BY ctid) AS rn
+                  FROM %I
+                 WHERE id IS NOT NULL
+            )
+            UPDATE %I AS target
+               SET id = nextval(%L::regclass)
+              FROM ranked
+             WHERE target.ctid = ranked.ctid
+               AND ranked.rn > 1
+            $sql$,
+            tbl_name,
+            tbl_name,
+            seq_name
+        );
+        EXECUTE format(
+            'SELECT setval(%L::regclass, COALESCE((SELECT MAX(id) FROM %I), 0) + 1, false)',
+            seq_name,
+            tbl_name
+        );
+
+        SELECT EXISTS (
+            SELECT 1
+              FROM pg_constraint
+             WHERE conrelid = relid
+               AND contype = 'p'
+        ) INTO has_pk;
+
+        IF NOT has_pk THEN
+            EXECUTE format('ALTER TABLE %I ALTER COLUMN id SET NOT NULL', tbl_name);
+            EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I PRIMARY KEY (id)', tbl_name, tbl_name || '_pkey');
+        END IF;
+    END LOOP;
+END $$;
 
 -- =====================================================================
 -- 033_ops_indexes_and_extensions.sql
@@ -519,6 +925,28 @@ CREATE INDEX IF NOT EXISTS idx_ops_retry_attempts_created_at
 CREATE INDEX IF NOT EXISTS idx_ops_retry_attempts_source_error
     ON ops_retry_attempts (source_error_id, created_at DESC)
     WHERE source_error_id IS NOT NULL;
+
+DO $$
+DECLARE
+    duplicate_sources TEXT;
+BEGIN
+    SELECT string_agg(source_error_id::TEXT || ' (count=' || duplicate_count::TEXT || ')', ', ')
+      INTO duplicate_sources
+      FROM (
+        SELECT source_error_id, COUNT(*) AS duplicate_count
+          FROM ops_retry_attempts
+         WHERE source_error_id IS NOT NULL
+           AND status IN ('queued', 'running')
+         GROUP BY source_error_id
+        HAVING COUNT(*) > 1
+         ORDER BY COUNT(*) DESC, source_error_id
+         LIMIT 10
+      ) d;
+
+    IF duplicate_sources IS NOT NULL THEN
+        RAISE EXCEPTION 'ops_retry_attempts has duplicate active retries for source_error_id: %. Resolve queued/running duplicates before applying 033_ops_monitoring_vnext.sql.', duplicate_sources;
+    END IF;
+END $$;
 
 -- Prevent concurrent retries for the same ops_error_logs row (race-free, multi-instance safe).
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ops_retry_attempts_unique_active

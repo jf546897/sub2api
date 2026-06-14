@@ -145,8 +145,16 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 	// 1) Try cache first.
 	if p.tokenCache != nil {
 		if token, err := p.tokenCache.GetAccessToken(ctx, cacheKey); err == nil && strings.TrimSpace(token) != "" {
-			slog.Debug("openai_token_cache_hit", "account_id", account.ID)
-			return token, nil
+			if latestAccount, isStale := CheckTokenVersion(ctx, account, p.accountRepo); isStale && latestAccount != nil {
+				slog.Debug("openai_token_cache_stale_use_latest", "account_id", account.ID)
+				if err := p.tokenCache.DeleteAccessToken(ctx, cacheKey); err != nil {
+					slog.Warn("openai_token_cache_delete_stale_failed", "account_id", account.ID, "error", err)
+				}
+				account = latestAccount
+			} else {
+				slog.Debug("openai_token_cache_hit", "account_id", account.ID)
+				return token, nil
+			}
 		} else if err != nil {
 			slog.Warn("openai_token_cache_get_failed", "account_id", account.ID, "error", err)
 		}
@@ -156,10 +164,14 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 
 	// 2) Refresh if needed (pre-expiry skew).
 	expiresAt := account.GetCredentialAsTime("expires_at")
-	needsRefresh := expiresAt == nil || time.Until(*expiresAt) <= openAITokenRefreshSkew
+	missingAccessToken := strings.TrimSpace(account.GetOpenAIAccessToken()) == ""
+	needsRefresh := missingAccessToken || expiresAt == nil || time.Until(*expiresAt) <= openAITokenRefreshSkew
 	if needsRefresh && strings.TrimSpace(account.GetOpenAIRefreshToken()) == "" {
-		if expiresAt != nil && !time.Now().Before(*expiresAt) {
-			const reason = "openai access_token expired and refresh_token is missing"
+		if missingAccessToken || (expiresAt != nil && !time.Now().Before(*expiresAt)) {
+			reason := "openai access_token expired and refresh_token is missing"
+			if missingAccessToken {
+				reason = "openai access_token missing and refresh_token is missing"
+			}
 			// 永久故障：缺失 refresh_token 时账号无法自愈，必须立即从调度池剔除，
 			// 否则会被反复选中、每次都在 token 阶段直接返回错误，对用户呈现持续 502。
 			p.disableAccountMissingRefreshToken(account, reason)
@@ -175,11 +187,11 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 
 		result, err := p.refreshAPI.RefreshIfNeeded(ctx, account, p.executor, openAITokenRefreshSkew)
 		if err != nil {
+			p.metrics.refreshFailure.Add(1)
 			if p.refreshPolicy.OnRefreshError == ProviderRefreshErrorReturn {
 				return "", err
 			}
 			slog.Warn("openai_token_refresh_failed", "account_id", account.ID, "error", err)
-			p.metrics.refreshFailure.Add(1)
 			refreshFailed = true
 		} else if result.LockHeld {
 			if p.refreshPolicy.OnLockHeld == ProviderLockHeldWaitForCache {
@@ -193,14 +205,19 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 					slog.Debug("openai_token_cache_hit_after_wait", "account_id", account.ID)
 					return token, nil
 				}
+				return "", errors.New("openai token refresh lock held and no refreshed token became available")
 			}
 		} else if result.Refreshed {
 			p.metrics.refreshSuccess.Add(1)
 			account = result.Account
 			expiresAt = account.GetCredentialAsTime("expires_at")
+			missingAccessToken = strings.TrimSpace(account.GetOpenAIAccessToken()) == ""
+			needsRefresh = missingAccessToken || expiresAt == nil || time.Until(*expiresAt) <= openAITokenRefreshSkew
 		} else {
 			account = result.Account
 			expiresAt = account.GetCredentialAsTime("expires_at")
+			missingAccessToken = strings.TrimSpace(account.GetOpenAIAccessToken()) == ""
+			needsRefresh = missingAccessToken || expiresAt == nil || time.Until(*expiresAt) <= openAITokenRefreshSkew
 		}
 	} else if needsRefresh && p.tokenCache != nil {
 		// Backward-compatible test path when refreshAPI is not injected.
@@ -224,7 +241,14 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 				slog.Debug("openai_token_cache_hit_after_wait", "account_id", account.ID)
 				return token, nil
 			}
+			if strings.TrimSpace(account.GetOpenAIRefreshToken()) != "" {
+				return "", errors.New("openai token refresh lock held and no refreshed token became available")
+			}
 		}
+	}
+
+	if needsRefresh && strings.TrimSpace(account.GetOpenAIRefreshToken()) != "" {
+		return "", openAIRefreshRequiredError(account, expiresAt)
 	}
 
 	accessToken := account.GetCredential("access_token")
@@ -268,6 +292,22 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 	}
 
 	return accessToken, nil
+}
+
+func openAIRefreshRequiredError(account *Account, expiresAt *time.Time) error {
+	if account == nil {
+		return errors.New("openai access_token requires refresh but no account is available")
+	}
+	if strings.TrimSpace(account.GetOpenAIAccessToken()) == "" {
+		return errors.New("openai access_token missing and refresh did not complete")
+	}
+	if expiresAt == nil {
+		return errors.New("openai access_token expiry is unknown and refresh did not complete")
+	}
+	if !time.Now().Before(*expiresAt) {
+		return errors.New("openai access_token expired and refresh did not complete")
+	}
+	return errors.New("openai access_token is within refresh window and refresh did not complete")
 }
 
 // disableAccountMissingRefreshToken 在请求路径上发现 OpenAI OAuth 账号
